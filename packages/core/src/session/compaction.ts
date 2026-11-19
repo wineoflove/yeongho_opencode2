@@ -24,6 +24,7 @@ import { Bus } from "../bus.js"
 import { Database } from "../database/database.js"
 import { llmClient } from "../effect/app-node-platform.js"
 import { Model } from "../model.js"
+import { Provider } from "../provider.js"
 import { State } from "../state.js"
 import { Token } from "../util/token.js"
 import type { SessionContext } from "./context.js"
@@ -37,6 +38,10 @@ import { toLLMMessages } from "./runner/to-llm-message.js"
 import { SessionRecentText } from "./recent-text.js"
 import { contentFilterError, toSessionError } from "./to-session-error.js"
 import { SessionUsage } from "./usage.js"
+import { AccountPool } from "../account-pool.js"
+import { AccountPoolFailure } from "../account-pool-failure.js"
+import { bindRequestModel } from "./request-model-binding.js"
+import { Integration } from "../integration.js"
 
 export type Settings = {
   auto: boolean
@@ -120,6 +125,13 @@ type Precomputed = {
 }
 
 const NOTHING_TO_COMPACT: Failure = { error: { type: "compaction.unavailable", message: "Nothing to compact yet" } }
+const POOLED_NATIVE_UNSUPPORTED: Failure = {
+  error: {
+    type: "provider.unsupported-operation",
+    message:
+      "Native compaction and native checkpoints cannot be used with account pools: checkpoint portability between accounts is unverified",
+  },
+}
 /** After each "too long" rejection, the next attempt aims at this share of the first rejected request's size. */
 const SHRINK_STEPS = [0.85, 0.7, 0.5, 0.35]
 // The least of the window kept free for the last reply before compaction and for the summary itself.
@@ -257,6 +269,8 @@ export const layer = Layer.effect(
     const models = yield* SessionRunnerModel.Service
     const db = (yield* Database.Service).db
     const requests = yield* SessionModelRequest.Service
+    const pools = yield* AccountPool.Service
+    const providers = yield* Provider.Service
 
     const scope = yield* Scope.Scope
     const precomputed = new Map<SessionContext.Loaded["session"]["id"], Precomputed>()
@@ -271,6 +285,16 @@ export const layer = Layer.effect(
       }),
     })
 
+    const pooledNative = (context: SessionContext.Loaded) =>
+      Effect.gen(function* () {
+        if (context.model.compaction?.type !== "native" && !context.messages.some(SessionHistory.isNativeCompaction))
+          return false
+        return (
+          context.model.accountBinding !== undefined ||
+          (yield* providers.get(context.model.ref.providerID))?.settings?.accountPool !== undefined
+        )
+      })
+
     /** The model that writes the summary, and the request size it aims for. */
     const selectModel = Effect.fnUntraced(function* (
       context: SessionContext.Loaded,
@@ -284,8 +308,18 @@ export const layer = Layer.effect(
             .resolve({ ...context.session, model: agent.model }, catalog.available, {
               kind: "compaction",
               agent: agent.id,
+              useAccountPool: true,
+              advanceAccountPool: false,
             })
-            .pipe(Effect.orElseSucceed(() => undefined)))) ??
+            .pipe(
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  const pooled = (yield* providers.get(agent.model!.providerID))?.settings?.accountPool !== undefined
+                  if (pooled || error instanceof Integration.AuthorizationError) return yield* Effect.fail(error)
+                  return undefined
+                }),
+              ),
+            ))) ??
         context.model
       const ceiling = calculateCeiling(model.limit, buffer)
       // An unknown window never triggers auto compaction, but the compaction request still needs a size to aim for.
@@ -309,7 +343,14 @@ export const layer = Layer.effect(
       const held = precomputed.get(context.session.id)
       precomputed.delete(context.session.id)
       const native = context.model.compaction?.type === "native"
-      const model = yield* selectModel(context, settings.buffer, native)
+      const selection = yield* selectModel(context, settings.buffer, native).pipe(Effect.result)
+      if (selection._tag === "Failure") {
+        if (held) yield* Fiber.interrupt(held.fiber)
+        if (trigger.reason !== "manual")
+          yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: context.session.id, reason: "auto" })
+        return yield* publish(trigger, { error: toSessionError(selection.failure) })
+      }
+      const model = selection.success
       // The provider just rejected this context, so the estimate ran low; the first attempt already aims below it.
       const budget =
         trigger.reason === "overflow"
@@ -321,6 +362,10 @@ export const layer = Layer.effect(
       // opens here, before any wait, so a background summary still being written shows as a running compaction.
       if (trigger.reason !== "manual")
         yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: context.session.id, reason: "auto" })
+      if ((yield* pooledNative(context)) || (model.context !== context && (yield* pooledNative(model.context)))) {
+        if (held) yield* Fiber.interrupt(held.fiber)
+        return yield* publish(selected, POOLED_NATIVE_UNSUPPORTED)
+      }
       const swapped = held ? yield* usePrecomputed(selected, held, budget, native) : undefined
       const compaction = swapped
         ? Effect.succeed(swapped)
@@ -355,6 +400,7 @@ export const layer = Layer.effect(
       if (context.model.compaction?.type === "native") return
       // An unknown window has an infinite ceiling, which this never reaches. Past the ceiling it still starts: at the
       // end of a turn, the next prompt then swaps it in instead of waiting for a summary.
+      if (yield* pooledNative(context)) return
       const ceiling = calculateCeiling(context.model.limit, settings.buffer)
       const estimate = given ?? estimatePrompt(context)
       const first = context.messages.find((message) => hasMeasuredPrompt(message, context.model.ref))
@@ -385,7 +431,8 @@ export const layer = Layer.effect(
       const age = (yield* Clock.currentTimeMillis) - DateTime.toEpochMillis(anchor.time.created)
       if (age > cacheLifetime(context.model.cache?.ttl) - CACHE_MARGIN) return
 
-      const model = yield* selectModel(context, settings.buffer, false)
+      const model = yield* selectModel(context, settings.buffer, false).pipe(Effect.orElseSucceed(() => undefined))
+      if (!model) return
       const usage: SessionUsage.Recorded[] = []
       const fiber = yield* summarize({ reason: "auto", context: model.context }, model.cap, settings.keep, {
         messages: context.messages.slice(0, anchorIndex),
@@ -786,50 +833,99 @@ export const layer = Layer.effect(
       const sessionID = context.session.id
       const unusable = (error: SessionError.Error) => Effect.fail<Failure>({ error })
 
-      return llm.stream(request, options).pipe(
-        Stream.runFoldEffect(
-          (): Streamed => ({ text: "" }),
-          (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
-            if (LLMEvent.is.textDelta(event)) {
-              const next = { ...streamed, text: streamed.text + event.text }
-              if (background) return Effect.succeed(next)
-              return bus.publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text }).pipe(Effect.as(next))
-            }
+      return Effect.gen(function* () {
+        const pooled = (yield* providers.get(context.model.ref.providerID))?.settings?.accountPool !== undefined
+        if (
+          (pooled || context.model.accountBinding) &&
+          request.messages.some((message) => message.content.some((part) => part.type === "compaction"))
+        )
+          return yield* Effect.fail(POOLED_NATIVE_UNSUPPORTED)
+        const selected = pooled
+          ? yield* models
+              .resolve({ ...context.session, model: context.model.ref }, catalog.available, {
+                kind: "compaction",
+                agent: context.agent.id,
+                useAccountPool: true,
+              })
+              .pipe(Effect.mapError((cause): Failure => ({ error: toSessionError(cause) })))
+          : context.model
+        if (
+          context.model.requestAuth?.integrationID !== selected.requestAuth?.integrationID ||
+          context.model.requestAuth?.method !== selected.requestAuth?.method
+        )
+          return yield* unusable({
+            type: "compaction.failed",
+            message: "Authentication changed while preparing the summary",
+          })
+        const rebound = pooled ? bindRequestModel(request, selected) : request
+        const operation = llm.stream(rebound, options).pipe(
+          Stream.runFoldEffect(
+            (): Streamed => ({ text: "" }),
+            (streamed, event): Effect.Effect<Streamed, AIError | Failure> => {
+              if (LLMEvent.is.textDelta(event)) {
+                const next = { ...streamed, text: streamed.text + event.text }
+                if (background) return Effect.succeed(next)
+                return bus.publish(SessionEvent.Compaction.Delta, { sessionID, text: event.text }).pipe(Effect.as(next))
+              }
 
-            if (LLMEvent.is.stepFinish(event)) {
-              return spend(sessionID, SessionUsage.record(event.usage, context.model.cost), background?.usage).pipe(
-                Effect.as(streamed),
-              )
-            }
+              if (LLMEvent.is.stepFinish(event)) {
+                return spend(sessionID, SessionUsage.record(event.usage, selected.cost), background?.usage).pipe(
+                  Effect.as(streamed),
+                )
+              }
 
-            if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
-            switch (event.reason.normalized) {
-              case "unknown":
-                return Effect.fail(
-                  new AIError({
-                    reason: new InvalidProviderOutputError({
-                      message: "The provider response ended with an unknown finish reason.",
-                      classification: "incomplete-stream",
+              if (!LLMEvent.is.finish(event)) return Effect.succeed(streamed)
+              switch (event.reason.normalized) {
+                case "unknown":
+                  return Effect.fail(
+                    new AIError({
+                      reason: new InvalidProviderOutputError({
+                        message: "The provider response ended with an unknown finish reason.",
+                        classification: "incomplete-stream",
+                      }),
                     }),
-                  }),
-                )
-              case "error":
-                return Effect.fail(
-                  new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
-                )
-              case "length":
-                return unusable({
-                  type: "compaction.failed",
-                  message: "Compaction summary reached the output token limit",
-                })
-              case "content-filter":
-                return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
-              default:
-                return Effect.succeed(streamed)
-            }
-          },
-        ),
-      )
+                  )
+                case "error":
+                  return Effect.fail(
+                    new AIError({ reason: new UnknownProviderError({ message: "Compaction generation failed" }) }),
+                  )
+                case "length":
+                  return unusable({
+                    type: "compaction.failed",
+                    message: "Compaction summary reached the output token limit",
+                  })
+                case "content-filter":
+                  return unusable(contentFilterError("Compaction summary was blocked by the provider", event.reason))
+                default:
+                  return Effect.succeed(streamed)
+              }
+            },
+          ),
+        )
+        if (!selected.accountBinding) return yield* operation
+        return yield* pools
+          .withAccount(
+            selected.accountBinding,
+            operation.pipe(
+              Effect.tapError((cause) =>
+                cause instanceof AIError && selected.accountBinding
+                  ? pools.reportFailure(
+                      selected.accountBinding,
+                      AccountPoolFailure.classify(cause),
+                      AccountPoolFailure.retryAfterMs(cause, selected.accountBinding.integrationID),
+                    )
+                  : selected.accountBinding && "error" in cause && cause.error.type === "provider.content-filter"
+                    ? pools.reportFailure(selected.accountBinding, "access-denied")
+                    : Effect.void,
+              ),
+            ),
+          )
+          .pipe(
+            Effect.mapError((cause) =>
+              cause instanceof AIError || "error" in cause ? cause : { error: toSessionError(cause) },
+            ),
+          )
+      })
     }
 
     /**
@@ -840,14 +936,15 @@ export const layer = Layer.effect(
      * output to it would leave next to no room. A prompt the estimate undersells is rejected and shrunk like any
      * other.
      */
-    const prepare = (
+    const prepare = Effect.fnUntraced(function* (
       context: SessionContext.Loaded,
       messages: ReadonlyArray<SessionMessage.Info>,
       budget: number,
       webSocket?: "session",
-    ) => {
+    ) {
+      if (yield* pooledNative(context)) return yield* Effect.fail(POOLED_NATIVE_UNSUPPORTED)
       const base = transcript(context, messages)
-      return requests.compaction({
+      return yield* requests.compaction({
         session: context.session,
         agent: context.agent.id,
         model: context.model,
@@ -857,7 +954,7 @@ export const layer = Layer.effect(
         webSocket,
         inputTokens: { measured: budget, estimated: 0 },
       })
-    }
+    })
 
     /** A request hook supplied the summary itself, so no model call happens. */
     const fromHook = (context: SessionContext.Loaded, supplied: SessionCompactionResult, background?: Background) => {
@@ -951,7 +1048,17 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Agent.node, Bus.node, Database.node, llmClient, Model.node, SessionModelRequest.node, SessionRunnerModel.node],
+  deps: [
+    Agent.node,
+    Bus.node,
+    Database.node,
+    llmClient,
+    Model.node,
+    SessionModelRequest.node,
+    SessionRunnerModel.node,
+    AccountPool.node,
+    Provider.node,
+  ],
 })
 
 /**

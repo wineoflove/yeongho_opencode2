@@ -43,6 +43,7 @@ const memoryCredentials = (initial: Credential.Info[]) => {
   const unused = () => Effect.die("unused credential method")
   const service = Credential.Service.of({
     refresh: unused,
+    commitRefresh: unused,
     all: unused,
     create: unused,
     activate: unused,

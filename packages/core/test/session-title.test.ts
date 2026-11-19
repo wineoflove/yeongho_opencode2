@@ -33,6 +33,9 @@ import { ProjectTable } from "@opencode/core/project/sql"
 import { App } from "@opencode/core/app"
 import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
+import { AccountPool } from "@opencode/core/account-pool"
+import { Credential } from "@opencode/core/credential"
+import { Integration } from "@opencode/core/integration"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
@@ -42,6 +45,9 @@ let requests: LLMRequest[] = []
 let selectedSmall: Model.Info | undefined
 let selectedPrimary: Model.Info | undefined
 let selections: Array<Session.Info["model"]> = []
+let binding: AccountPool.Binding | undefined
+let poolReservations = 0
+let hiddenSelection = false
 const model = LanguageModel.make({
   id: "title-model",
   provider: "test",
@@ -86,23 +92,40 @@ const successfulTitle = () =>
   )
 let titleStream: (request: LLMRequest) => Stream.Stream<LLMEvent, AIError> = successfulTitle
 const client = Layer.mock(LLMClient.Service)({
-  stream: (request: LLMRequest) => {
-    requests.push(request)
-    return titleStream(request)
-  },
+  stream: (request: LLMRequest) =>
+    Stream.suspend(() => {
+      requests.push(request)
+      return titleStream(request)
+    }),
   generate: () => Effect.die("unused"),
 })
 const models = Layer.mock(SessionRunnerModel.Service)({
-  resolve: (session) => {
+  resolve: (session, _available, options) => {
+    if (hiddenSelection && session.model?.id === "title-hidden")
+      return Effect.fail(
+        new SessionRunnerModel.ModelUnavailableError({
+          providerID: Provider.ID.make("test"),
+          modelID: Model.ID.make("title-hidden"),
+        }),
+      )
+    if (options?.useAccountPool && options.advanceAccountPool !== false) poolReservations++
     selections.push(session.model)
-    return Effect.succeed(
-      SessionRunnerModel.resolved(session.model?.id === "title-small" ? smallModel : model, {
-        capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
-        cost,
-        limit: { context: 200_000, output: 32_000 },
-        variant: session.model?.variant,
-      }),
-    )
+    return Effect.succeed({
+      ...SessionRunnerModel.resolved(
+        hiddenSelection
+          ? LanguageModel.update(model, { id: "title-hidden" })
+          : session.model?.id === "title-small"
+            ? smallModel
+            : model,
+        {
+          capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+          cost,
+          limit: { context: 200_000, output: 32_000 },
+          variant: session.model?.variant,
+        },
+      ),
+      accountBinding: options?.useAccountPool ? binding : undefined,
+    })
   },
 })
 const smallModels = Layer.mock(Model.Service, {
@@ -119,6 +142,7 @@ const it = testEffect(
       Agent.node,
       PluginHooks.node,
       SessionTitle.node,
+      AccountPool.node,
     ]),
     [
       llmClient.replace(client),
@@ -192,6 +216,9 @@ beforeEach(() => {
   selectedPrimary = undefined
   selections = []
   titleStream = successfulTitle
+  binding = undefined
+  poolReservations = 0
+  hiddenSelection = false
 })
 
 const enableTitleAgent = Effect.gen(function* () {
@@ -204,6 +231,101 @@ const enableTitleAgent = Effect.gen(function* () {
     })
   })
 })
+
+it.effect("nonpool title uses its already resolved hidden model without picker reselection", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.create()
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Title for hidden deployment")
+    hiddenSelection = true
+    const titles = yield* SessionTitle.Service
+    yield* titles.generate(sessionID)
+    expect(requests).toHaveLength(1)
+    expect(String(requests[0]?.model.id)).toBe("title-hidden")
+  }),
+)
+
+it.effect("does not send a title request when the selected account pool is paused", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_paused_pool")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Fixture title request")
+    binding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_title") }
+    const pool = yield* AccountPool.Service
+    yield* pool.reportFailure(binding, "access-denied")
+    const store = yield* SessionStore.Service
+    const before = yield* store.get(sessionID)
+    const titles = yield* SessionTitle.Service
+    yield* titles.generate(sessionID)
+    expect(requests).toHaveLength(0)
+    expect((yield* store.get(sessionID))?.title).toBe(before?.title)
+  }),
+)
+
+it.effect("keeps the title unchanged and pauses the pool when a title stream is content-filtered", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_filtered_pool")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Fixture")
+    binding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_filtered_title") }
+    titleStream = () =>
+      Stream.make(
+        LLMEvent.textDelta({ id: "title", text: "Must not be saved" }),
+        LLMEvent.finish({ reason: { normalized: "content-filter" } }),
+      )
+    const store = yield* SessionStore.Service
+    const before = yield* store.get(sessionID)
+    const titles = yield* SessionTitle.Service
+    yield* titles.generate(sessionID)
+    const pools = yield* AccountPool.Service
+    expect((yield* pools.status(binding.integrationID)).paused).toBe(true)
+    expect((yield* store.get(sessionID))?.title).toBe(before?.title)
+    expect(requests).toHaveLength(1)
+  }),
+)
+
+it.effect("does not fall back to another model after a bound title provider failure", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    selectedSmall = small
+    const sessionID = Session.ID.make("ses_title_pool_no_fallback")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Fixture")
+    binding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_title_fallback") }
+    titleStream = () =>
+      Stream.fail(new AIError({ reason: new InvalidRequestError({ message: "Fixture provider rejection" }) }))
+    const store = yield* SessionStore.Service
+    const before = yield* store.get(sessionID)
+    const titles = yield* SessionTitle.Service
+    yield* titles.generate(sessionID)
+    expect(requests).toHaveLength(1)
+    expect((yield* store.get(sessionID))?.title).toBe(before?.title)
+  }),
+)
+
+it.effect("does not reserve a pool account when a hook supplies the title without inference", () =>
+  Effect.gen(function* () {
+    yield* enableTitleAgent
+    const sessionID = Session.ID.make("ses_title_hook_no_reservation")
+    yield* insertSession(sessionID)
+    yield* prompt(sessionID, "Fixture")
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "title", (event) =>
+      Effect.sync(() => {
+        event.result = "Local hook title"
+      }),
+    )
+    const titles = yield* SessionTitle.Service
+    yield* titles.generate(sessionID)
+    const store = yield* SessionStore.Service
+    expect((yield* store.get(sessionID))?.title).toBe("Local hook title")
+    expect(requests).toHaveLength(0)
+    expect(poolReservations).toBe(0)
+  }),
+)
 
 it.effect("generates a title from the sole user message and renames the session", () =>
   Effect.gen(function* () {

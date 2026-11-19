@@ -6,6 +6,7 @@ import { ConfigAgent } from "@opencode/schema/config/agent"
 import path from "path"
 import { Effect, Result, SchemaIssue, SchemaParser } from "effect"
 import { Agent } from "../../agent.js"
+import { Model } from "@opencode/schema/model"
 import { Config } from "../../config.js"
 import { ConfigMarkdown } from "../markdown.js"
 import { ConfigEntryObserver } from "./entry-observer.js"
@@ -72,13 +73,16 @@ export const Plugin = define({
         editor.update(current.id, (agent) => agent.permissions.push(...permissions))
       }
 
+      const variantDefaults = new Map<Agent.ID, string>()
       for (const document of loaded.documents) {
         for (const [id, item] of Object.entries(document.info.agents ?? {})) {
           const agentID = Agent.ID.make(id)
           if (item.disabled) {
             editor.remove(agentID)
+            variantDefaults.delete(agentID)
             continue
           }
+          if (item.variant !== undefined) variantDefaults.set(agentID, item.variant)
 
           const exists = editor.get(agentID) !== undefined
           editor.update(agentID, (agent) => {
@@ -104,6 +108,12 @@ export const Plugin = define({
             }
           })
         }
+      }
+      for (const [id, variant] of variantDefaults) {
+        if (!editor.get(id)?.model) continue
+        editor.update(id, (agent) => {
+          if (agent.model && agent.model.variant === undefined) agent.model.variant = Model.VariantID.make(variant)
+        })
       }
     })
   }),

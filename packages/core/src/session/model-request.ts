@@ -1,4 +1,5 @@
 export * as SessionModelRequest from "./model-request.js"
+import { withRequestAuth } from "../request-auth.js"
 
 import {
   ai,
@@ -128,9 +129,7 @@ export const baseTranscript = (input: {
     messages: input.messages.flatMap((message) =>
       toLLMMessages([message], input.model.ref, providerMetadataKey).map(
         (item): SessionRequestMessage =>
-          message.metadata === undefined || item.id !== message.id
-            ? item
-            : { ...item, metadata: message.metadata },
+          message.metadata === undefined || item.id !== message.id ? item : { ...item, metadata: message.metadata },
       ),
     ),
   }
@@ -291,20 +290,23 @@ export const layer = Layer.effect(
       )
       // Hooks see the default output limit and may change or remove it. Titles and generate keep the provider default,
       // because their reasoning is hard to budget.
-      const shaped = yield* shape(
-        {
-          sessionID: session.id,
-          model: model.ref,
-          system: input.system,
-          messages: input.messages,
-          options:
-            kind === "primary"
-              ? { maxTokens: outputLimit(model.limit, input.inputTokens, WINDOW_HEADROOM) }
-              : kind === "compaction"
-                ? { maxTokens: outputLimit(model.limit, input.inputTokens) }
-                : {},
-        },
-        Object.fromEntries(Array.from(given, ([d, t]) => [t.name, d])),
+      const shaped = yield* withRequestAuth(
+        shape(
+          {
+            sessionID: session.id,
+            model: model.ref,
+            system: input.system,
+            messages: input.messages,
+            options:
+              kind === "primary"
+                ? { maxTokens: outputLimit(model.limit, input.inputTokens, WINDOW_HEADROOM) }
+                : kind === "compaction"
+                  ? { maxTokens: outputLimit(model.limit, input.inputTokens) }
+                  : {},
+          },
+          Object.fromEntries(Array.from(given, ([d, t]) => [t.name, d])),
+        ),
+        model.requestAuth,
       )
       // Match by identity first, then by key. Entries matching neither were invented by a
       // hook and are dropped. `t.name` stays the real name so execution can map renames back.
@@ -358,11 +360,14 @@ export const layer = Layer.effect(
       })
 
       const baseURL = base.model.route.endpoint.baseURL
-      const modelHook = yield* hooks.trigger("session", "model.request", {
-        ...scope,
-        baseURL,
-        headers: { ...base.headers },
-      })
+      const modelHook = yield* withRequestAuth(
+        hooks.trigger("session", "model.request", {
+          ...scope,
+          baseURL,
+          headers: { ...base.headers },
+        }),
+        model.requestAuth,
+      )
       const route =
         modelHook.baseURL !== undefined && modelHook.baseURL !== baseURL
           ? base.model.route.with({ endpoint: { baseURL: modelHook.baseURL } })
@@ -379,7 +384,10 @@ export const layer = Layer.effect(
         ? (req, handler) =>
             Effect.gen(function* () {
               const request = yield* HttpClientRequest.toWeb(req)
-              const before = yield* hooks.trigger("session", "http.request", { ...scope, request })
+              const before = yield* withRequestAuth(
+                hooks.trigger("session", "http.request", { ...scope, request }),
+                model.requestAuth,
+              )
               // A hook that kept the request object cannot have replaced its body, so the original body is sent as is.
               // Reading it back would hold a second full copy of the request, screenshots included, for the whole call.
               const sent =
@@ -393,14 +401,17 @@ export const layer = Layer.effect(
                       )
                     : HttpClientRequest.fromWeb(before.request)
               const res = yield* handler(sent)
-              const after = yield* hooks.trigger("session", "http.response", {
-                ...scope,
-                request: before.request,
-                response: new Response(
-                  [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
-                  { status: res.status, headers: res.headers },
-                ),
-              })
+              const after = yield* withRequestAuth(
+                hooks.trigger("session", "http.response", {
+                  ...scope,
+                  request: before.request,
+                  response: new Response(
+                    [204, 205, 304].includes(res.status) ? null : yield* Stream.toReadableStreamEffect(res.stream),
+                    { status: res.status, headers: res.headers },
+                  ),
+                }),
+                model.requestAuth,
+              )
               return HttpClientResponse.fromWeb(sent, after.response)
             })
         : undefined
@@ -418,15 +429,20 @@ export const layer = Layer.effect(
                       url: connect.url,
                       headers: connect.headers,
                     })
-                    .pipe(Effect.map((event) => ({ url: event.url, headers: event.headers }))),
+                    .pipe(
+                      Effect.map((event) => ({ url: event.url, headers: event.headers })),
+                      (operation) => withRequestAuth(operation, model.requestAuth),
+                    ),
                 send: (frame) =>
-                  hooks
-                    .trigger("session", "experimental.ws.send", { ...scope, frame })
-                    .pipe(Effect.map((event) => event.frame)),
+                  hooks.trigger("session", "experimental.ws.send", { ...scope, frame }).pipe(
+                    Effect.map((event) => event.frame),
+                    (operation) => withRequestAuth(operation, model.requestAuth),
+                  ),
                 receive: (frame) =>
-                  hooks
-                    .trigger("session", "experimental.ws.receive", { ...scope, frame })
-                    .pipe(Effect.map((event) => event.frame)),
+                  hooks.trigger("session", "experimental.ws.receive", { ...scope, frame }).pipe(
+                    Effect.map((event) => event.frame),
+                    (operation) => withRequestAuth(operation, model.requestAuth),
+                  ),
               },
               model.chunkTimeout,
             )
@@ -437,7 +453,7 @@ export const layer = Layer.effect(
         request,
         options: { ...(http ? { http } : {}), ...(webSocket ? { webSocket } : {}) },
         retry: (event: Parameters<Prepared["retry"]>[0]) =>
-          hooks.trigger("session", "retry", event).pipe(Effect.asVoid),
+          withRequestAuth(hooks.trigger("session", "retry", event).pipe(Effect.asVoid), model.requestAuth),
         // Permission.assert and the question tool throw declines as defects so tools cannot
         // catch them and turn a "no" into model-visible output. Recover them here as failures,
         // including declines a tool rethrew and its wrapper attached to a Tool.Error, as Promise

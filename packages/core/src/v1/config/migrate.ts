@@ -42,6 +42,10 @@ export function migrateAgent(info: ConfigAgentV1.Info) {
   return decodeAgent(
     JSON.stringify({
       model: modelSelection(info.model, info.variant),
+      variant:
+        info.model === undefined && info.variant !== undefined && info.variant.length > 0 && !info.variant.includes("#")
+          ? info.variant
+          : undefined,
       request: Object.keys(body).length ? { body } : undefined,
       system: info.prompt,
       description: info.description,
@@ -246,9 +250,7 @@ function migrateModel(info: typeof ConfigProviderV1.Model.Type, npm: string | un
     capabilities,
     headers: info.headers,
     body: migrated?.body,
-    variants:
-      info.variants &&
-      Object.entries(info.variants).map(([id, options]) => ({ id, ...split(options) })),
+    variants: info.variants && Object.entries(info.variants).map(([id, options]) => ({ id, ...split(options) })),
     cost: costs,
     disabled: info.status === "deprecated" ? true : undefined,
     limit: info.limit && {

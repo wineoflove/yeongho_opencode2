@@ -99,6 +99,8 @@ import type {
   ExperimentalSessionExportOutput,
   ExperimentalSessionSkillInput,
   ExperimentalSessionSkillOutput,
+  ExperimentalSessionReportInput,
+  ExperimentalSessionReportOutput,
   ExperimentalSessionWaitInput,
   ExperimentalSessionWaitOutput,
   ExperimentalSessionInstructionsEntryListInput,
@@ -128,6 +130,8 @@ import type {
   ExperimentalVoiceModelsOutput,
   ExperimentalVoiceSessionInput,
   ExperimentalVoiceSessionOutput,
+  ProviderPoolInput,
+  ProviderPoolOutput,
   ProviderListInput,
   ProviderListOutput,
   ProviderGetInput,
@@ -840,6 +844,18 @@ const EndpointExperimentalSessionSkill = (raw: RawClient["server.session"]) => (
     }).pipe(Effect.mapError(mapClientError)),
   )
 
+const EndpointExperimentalSessionReport =
+  (raw: RawClient["server.session"]) => (input: ExperimentalSessionReportInput) =>
+    preserveEffect<ExperimentalSessionReportOutput>()(
+      raw["session.report"]({
+        params: { sessionID: input["sessionID"] },
+        payload: { messageID: input["messageID"], text: input["text"] },
+      }).pipe(
+        Effect.mapError(mapClientError),
+        Effect.map((value) => value.data),
+      ),
+    )
+
 const EndpointExperimentalSessionWait = (raw: RawClient["server.session"]) => (input: ExperimentalSessionWaitInput) =>
   preserveEffect<ExperimentalSessionWaitOutput>()(
     raw["session.wait"]({ params: { sessionID: input["sessionID"] } }).pipe(Effect.mapError(mapClientError)),
@@ -889,6 +905,7 @@ const adaptGroupExperimentalSession = (raw: RawClient["server.session"]) => ({
   import: EndpointExperimentalSessionImport(raw),
   export: EndpointExperimentalSessionExport(raw),
   skill: EndpointExperimentalSessionSkill(raw),
+  report: EndpointExperimentalSessionReport(raw),
   wait: EndpointExperimentalSessionWait(raw),
   instructions: {
     entry: {
@@ -1025,6 +1042,13 @@ const adaptGroupExperimentalVoice = (raw: RawClient["server.voice"]) => ({
   session: EndpointExperimentalVoiceSession(raw),
 })
 
+const EndpointProviderPool = (raw: RawClient["server.provider"]) => (input: ProviderPoolInput) =>
+  preserveEffect<ProviderPoolOutput>()(
+    raw["provider.pool"]({ params: { providerID: input["providerID"] }, query: { location: input["location"] } }).pipe(
+      Effect.mapError(mapClientError),
+    ),
+  )
+
 const EndpointProviderList = (raw: RawClient["server.provider"]) => (input?: ProviderListInput) =>
   preserveEffect<ProviderListOutput>()(
     raw["provider.list"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
@@ -1038,6 +1062,7 @@ const EndpointProviderGet = (raw: RawClient["server.provider"]) => (input: Provi
   )
 
 const adaptGroupProvider = (raw: RawClient["server.provider"]) => ({
+  pool: EndpointProviderPool(raw),
   list: EndpointProviderList(raw),
   get: EndpointProviderGet(raw),
 })

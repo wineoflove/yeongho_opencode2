@@ -244,7 +244,7 @@ describe("OpenAIPlugin", () => {
     }),
   )
 
-  it.effect("reloads providers on a switch only when the ChatGPT login changes", () =>
+  it.effect("reloads providers on a switch to keep catalog authentication bound to the selected credential", () =>
     Effect.gen(function* () {
       const catalog = yield* Provider.Service
       const credentials = yield* Credential.Service
@@ -268,7 +268,11 @@ describe("OpenAIPlugin", () => {
       })
       yield* credentials.activate(first.id)
       yield* drain
-      expect(folds.count).toBe(before)
+      expect(folds.count).toBeGreaterThan(before)
+      expect((yield* catalog.snapshot()).records.get(Provider.ID.openai)?.catalogAuth).toMatchObject({
+        sourceKey: `credential:${first.id}`,
+        method: null,
+      })
 
       yield* credentials.create({
         integrationID: Integration.ID.make("openai"),

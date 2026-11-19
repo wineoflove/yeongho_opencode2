@@ -20,6 +20,9 @@ import {
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
 import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
 import { TestLLM, compileRequest } from "@opencode/ai/testing"
+import type { AccountPool } from "@opencode/core/account-pool"
+import { Credential } from "@opencode/core/credential"
+import { Integration } from "@opencode/core/integration"
 import { RequestExecutor } from "@opencode/ai/route"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Database } from "@opencode/core/database/database"
@@ -235,6 +238,7 @@ const makeRunnerState = (compaction?: SessionRunnerModel.Resolved["compaction"])
     }).pipe(Effect.andThen(Deferred.succeed(barrier.release, undefined)), Effect.asVoid)
   return {
     currentModel: model,
+    accountBinding: undefined as AccountPool.Binding | undefined,
     compaction,
     modelResolveHook: resolvesModel,
     systemBaseline: "Initial context",
@@ -352,13 +356,16 @@ const layer = Layer.unwrap(
         state.modelResolveHook.pipe(
           Effect.map(() => {
             const selected = session.model?.id === "replacement" ? replacementModel : state.currentModel
-            return SessionRunnerModel.resolved(selected, {
-              capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
-              cost: [],
-              limit: modelLimits.get(String(selected.id)) ?? defaultModelLimit,
-              variant: session.model?.variant,
-              compaction: state.compaction,
-            })
+            return {
+              ...SessionRunnerModel.resolved(selected, {
+                capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
+                cost: [],
+                limit: modelLimits.get(String(selected.id)) ?? defaultModelLimit,
+                variant: session.model?.variant,
+                compaction: state.compaction,
+              }),
+              accountBinding: state.accountBinding,
+            }
           }),
         ),
     })
@@ -1879,6 +1886,40 @@ describe("SessionRunnerLLM", () => {
     },
   )
 
+  for (const auto of [false, true]) {
+    scenario(`pool refuses native checkpoint replay with auto=${auto} below threshold`, function* (s) {
+      const compaction = yield* SessionCompaction.Service
+      yield* compaction.transform((editor) => editor.configure({ auto }))
+      yield* s.runPrompt("Before checkpoint")
+      yield* s.bus.publish(SessionEvent.Compaction.Ended, {
+        sessionID,
+        reason: "manual",
+        text: "",
+        model: { providerID: Provider.ID.make(s.currentModel.provider), id: ID.make(s.currentModel.id) },
+        native: {
+          messages: JSON.parse(
+            JSON.stringify([
+              Message.assistant(
+                CompactionPart.make({ provider: s.currentModel.provider, encrypted: "private-checkpoint" }),
+              ),
+            ]),
+          ),
+        },
+      })
+      s.accountBinding = {
+        integrationID: Integration.ID.make("fake"),
+        credentialID: Credential.ID.make("cred_checkpoint"),
+      }
+      const before = (yield* s.messages).filter((message) => message.type === "compaction")
+      s.requests.length = 0
+      yield* s.admit("After checkpoint")
+      const result = yield* Effect.exit(s.resume)
+      expect(Exit.isFailure(result)).toBe(true)
+      expect(s.requests).toEqual([])
+      expect((yield* s.messages).filter((message) => message.type === "compaction")).toEqual(before)
+    })
+  }
+
   scenario("seeds a fork with the parent's newest instruction values", function* (s) {
     yield* s.runPrompt("First")
     s.systemBaseline = "Changed context"
@@ -2083,9 +2124,7 @@ describe("SessionRunnerLLM", () => {
     expect(userTexts(last)).toEqual(["First", "Fourth"])
     expect(last.system.map((part) => part.text).join("\n")).not.toContain("Entered mode")
     // Clients still see every message; only the model context hides the stale update.
-    expect((yield* s.messages).filter((message) => message.type === "system")).toMatchObject([
-      { text: "Entered mode" },
-    ])
+    expect((yield* s.messages).filter((message) => message.type === "system")).toMatchObject([{ text: "Entered mode" }])
   })
 
   scenario("uses the selected model family prompt when the agent does not override it", function* (s) {
@@ -3854,7 +3893,7 @@ describe("SessionRunnerLLM", () => {
     const run = yield* s.resume.pipe(Effect.forkChild)
     yield* first.started
     expect(reads).toBe(1)
-    expect(resolutions).toBe(1)
+    expect(resolutions).toBe(2)
     expect(s.requests[0]?.model).toBe(recoveryModel)
 
     const summary = yield* s.llm.gate()
@@ -3877,7 +3916,7 @@ describe("SessionRunnerLLM", () => {
     yield* retry.started
 
     expect(reads).toBe(2)
-    expect(resolutions).toBe(2)
+    expect(resolutions).toBe(4)
     expect(s.requests).toHaveLength(3)
     expect(s.requests[2]?.model).toBe(replacementModel)
     expect(s.requests[2]?.system.map((part) => part.text)).toEqual([

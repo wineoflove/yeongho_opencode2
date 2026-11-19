@@ -81,6 +81,70 @@ for (const cancel of [false, true]) {
   )
 }
 
+for (const mutation of ["replace", "remove", "metadata", "method"] as const) {
+  it.effect(`rejects stale refresh output when its credential is ${mutation}d while refreshing`, () =>
+    Effect.gen(function* () {
+      const services = yield* locations
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      const integrationID = Integration.ID.make("openai")
+      const methodID = Integration.MethodID.make("oauth")
+      const stored = yield* services.credentials.create({
+        integrationID,
+        value: Credential.OAuth.make({ type: "oauth", methodID, access: "old", refresh: "old-refresh", expires: 1 }),
+      })
+      yield* services.a.transform((editor) =>
+        editor.method.update({
+          integrationID,
+          method: { id: methodID, type: "oauth", label: "OAuth" },
+          authorize: () => Effect.die("unused sign-in"),
+          refresh: (value) =>
+            Effect.gen(function* () {
+              yield* Deferred.succeed(entered, undefined)
+              yield* Deferred.await(release)
+              return Credential.OAuth.make({
+                ...value,
+                access: "stale-refresh-result",
+                expires: Number.MAX_SAFE_INTEGER,
+              })
+            }),
+        }),
+      )
+      const connection = { type: "credential" as const, id: stored.id, label: stored.label, method: "oauth" as const }
+      const pending = yield* services.a.connection.resolve(connection).pipe(Effect.result, Effect.forkScoped)
+      yield* Deferred.await(entered)
+      const replacement =
+        mutation === "metadata"
+          ? Credential.OAuth.make({
+              type: "oauth",
+              methodID,
+              access: "old",
+              refresh: "old-refresh",
+              expires: 1,
+              metadata: { accountID: "different-account" },
+            })
+          : mutation === "method"
+            ? Credential.OAuth.make({
+                type: "oauth",
+                methodID: Integration.MethodID.make("different-method"),
+                access: "old",
+                refresh: "old-refresh",
+                expires: 1,
+              })
+            : Credential.Key.make({ type: "key", key: "manual-replacement" })
+      if (mutation !== "remove") yield* services.credentials.update(stored.id, { value: replacement })
+      else yield* services.credentials.remove(stored.id)
+      yield* Deferred.succeed(release, undefined)
+      const result = yield* Fiber.join(pending)
+      expect((yield* services.credentials.get(stored.id))?.value).toEqual(
+        mutation !== "remove" ? replacement : undefined,
+      )
+      expect(result._tag).toBe("Failure")
+      if (result._tag === "Failure") expect(result.failure).toBeInstanceOf(Integration.AuthorizationError)
+    }),
+  )
+}
+
 it.effect("bounds a stuck integration refresh and allows a later attempt", () =>
   Effect.gen(function* () {
     const services = yield* locations

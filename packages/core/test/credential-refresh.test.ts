@@ -43,17 +43,19 @@ describe("Credential.refresh", () => {
     }),
   )
 
-  it.effect("keeps a row that changed while the refresh ran", () =>
+  it.effect("keeps a changed row and rejects stale refresh output without adopting another account identity", () =>
     Effect.gen(function* () {
       const credentials = yield* Credential.Service
       const id = yield* create
       const replaced = oauth("other-access", "other-refresh", 3)
-      const result = yield* credentials.refresh(id, {
-        stale: always,
-        refresh: () =>
-          credentials.update(id, { value: replaced }).pipe(Effect.as(oauth("new-access", "new-refresh", 2))),
-      })
-      expect(result).toEqual(replaced)
+      const result = yield* credentials
+        .refresh(id, {
+          stale: always,
+          refresh: () =>
+            credentials.update(id, { value: replaced }).pipe(Effect.as(oauth("new-access", "new-refresh", 2))),
+        })
+        .pipe(Effect.flip)
+      expect(result).toBeInstanceOf(Credential.ChangedError)
       expect((yield* credentials.get(id))?.value).toEqual(replaced)
     }),
   )

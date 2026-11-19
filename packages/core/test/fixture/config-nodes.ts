@@ -9,6 +9,7 @@ export const emptyCredentialNode = makeGlobalNode({
     Credential.Service,
     Credential.Service.of({
       refresh: () => Effect.die("unused Credential.refresh"),
+      commitRefresh: () => Effect.die("unused Credential.commitRefresh"),
       all: () => Effect.succeed([]),
       list: () => Effect.succeed([]),
       get: () => Effect.undefined,

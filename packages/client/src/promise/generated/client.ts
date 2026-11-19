@@ -93,6 +93,8 @@ import type {
   ExperimentalSessionExportOutput,
   ExperimentalSessionSkillInput,
   ExperimentalSessionSkillOutput,
+  ExperimentalSessionReportInput,
+  ExperimentalSessionReportOutput,
   ExperimentalSessionWaitInput,
   ExperimentalSessionWaitOutput,
   ExperimentalSessionInstructionsEntryListInput,
@@ -122,6 +124,8 @@ import type {
   ExperimentalVoiceModelsOutput,
   ExperimentalVoiceSessionInput,
   ExperimentalVoiceSessionOutput,
+  ProviderPoolInput,
+  ProviderPoolOutput,
   ProviderListInput,
   ProviderListOutput,
   ProviderGetInput,
@@ -1114,6 +1118,18 @@ export function make(options: ClientOptions) {
             },
             requestOptions,
           ),
+        report: (input: ExperimentalSessionReportInput, requestOptions?: RequestOptions) =>
+          request<{ readonly data: ExperimentalSessionReportOutput }>(
+            {
+              method: "POST",
+              path: `/api/experimental/session/${encodeURIComponent(input.sessionID)}/report`,
+              body: { messageID: input["messageID"], text: input["text"] },
+              successStatus: 200,
+              declaredStatuses: [400, 401, 404, 409],
+              empty: false,
+            },
+            requestOptions,
+          ).then((value) => value.data),
         wait: (input: ExperimentalSessionWaitInput, requestOptions?: RequestOptions) =>
           request<ExperimentalSessionWaitOutput>(
             {
@@ -1841,6 +1857,18 @@ export function make(options: ClientOptions) {
         ),
     },
     provider: {
+      pool: (input: ProviderPoolInput, requestOptions?: RequestOptions) =>
+        request<ProviderPoolOutput>(
+          {
+            method: "GET",
+            path: `/api/provider/${encodeURIComponent(input.providerID)}/pool`,
+            query: { location: input["location"] },
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404, 503],
+            empty: false,
+          },
+          requestOptions,
+        ),
       list: (input?: ProviderListInput, requestOptions?: RequestOptions) =>
         request<ProviderListOutput>(
           {

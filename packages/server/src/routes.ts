@@ -46,6 +46,7 @@ import { Context, Effect, Layer, Option } from "effect"
 import { Api } from "./api"
 import { ServerAuth } from "./auth"
 import { CorsConfig } from "./cors"
+import { AccountPool } from "@opencode/core/account-pool"
 import { handlers } from "./handlers"
 import { authorizationLayer } from "./middleware/authorization"
 import { schemaErrorLayer } from "./middleware/schema-error"
@@ -59,6 +60,7 @@ import type { ServerOptions } from "./options"
 
 const applicationServiceNodes = [
   App.node,
+  AccountPool.node,
   Global.node,
   FSUtil.node,
   Database.node,
@@ -193,6 +195,7 @@ function makeRoutes<AuthError, AuthServices>(
       const requestServices = Layer.merge(
         Layer.succeedContext(
           Context.pick(
+            AccountPool.Service,
             Database.Service,
             Credential.Service,
             PermissionSaved.Service,

@@ -1,11 +1,28 @@
 import { Provider } from "@opencode/schema/provider"
 import { Location } from "@opencode/schema/location"
+import { AccountPool } from "@opencode/schema/account-pool"
 import { Schema } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/http-api"
 import { ProviderNotFoundError, ServiceUnavailableError } from "../errors.js"
 import { LocationQuery, locationQueryOpenApi } from "./location.js"
 
 export const ProviderGroup = HttpApiGroup.make("server.provider")
+  .add(
+    HttpApiEndpoint.get("provider.pool", "/api/provider/:providerID/pool", {
+      params: { providerID: Provider.ID },
+      query: LocationQuery,
+      success: Location.response(AccountPool.Status),
+      error: [ProviderNotFoundError, ServiceUnavailableError],
+    })
+      .annotateMerge(locationQueryOpenApi)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "provider.pool",
+          summary: "Get account pool status",
+          description: "Read configured account membership and sanitized selection state without credential values.",
+        }),
+      ),
+  )
   .add(
     HttpApiEndpoint.get("provider.list", "/api/provider", {
       query: LocationQuery,
