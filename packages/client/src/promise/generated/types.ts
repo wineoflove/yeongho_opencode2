@@ -218,11 +218,11 @@ export type VoiceWebSocketTransport = { type: "websocket"; url: string; token: s
 
 export type IntegrationID = string
 
+export type CredentialID = string
+
 export type IntegrationMethodID = string
 
 export type IntegrationEnvMethod = { type: "env"; names: Array<string> }
-
-export type CredentialID = string
 
 export type ConnectionStatus = { status: "needs_auth"; message: string; url?: string }
 
@@ -725,6 +725,22 @@ export type GenerateChoiceAnswer = {
 export type VoiceModel = { model: string; provider: string; transports: Array<VoiceTransportType>; available: boolean }
 
 export type VoiceTransport = VoiceWebRTCTransport | VoiceWebSocketTransport
+
+export type AccountPoolStatus = {
+  integrationID: IntegrationID
+  enabled: boolean
+  strategy: "round-robin" | null
+  paused: boolean
+  lastSelectedCredentialID: CredentialID | null
+  accounts: Array<{
+    credentialID: CredentialID
+    enabled: boolean
+    failure: "access-denied" | "authentication" | "rate-limited" | "service" | "transport" | "unknown" | null
+    authInvalid: boolean
+    cooldownUntil: number | null
+    observedAt: number | null
+  }>
+}
 
 export type IntegrationCommandMethod = {
   id: IntegrationMethodID
@@ -3932,6 +3948,13 @@ export type ExperimentalVoiceSessionInput = {
 }
 
 export type ExperimentalVoiceSessionOutput = VoiceSessionResponse["data"]
+
+export type ProviderPoolInput = {
+  readonly providerID: string
+  readonly location?: { readonly directory?: string | undefined } | undefined
+}
+
+export type ProviderPoolOutput = { location: LocationPublicRef; data: AccountPoolStatus }
 
 export type ProviderListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 

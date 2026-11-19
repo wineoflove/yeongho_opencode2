@@ -12,6 +12,8 @@ import { Provider } from "@opencode/core/provider"
 import { Variant } from "@opencode/core/variant"
 import { ModelResolver } from "@opencode/core/model-resolver"
 import { AISDK } from "@opencode/core/aisdk"
+import { AccountPool } from "@opencode/core/account-pool"
+import { LayerNode } from "@opencode/util/effect/layer-node"
 import { Npm } from "@opencode/util/npm"
 import { it } from "./lib/effect"
 
@@ -82,6 +84,92 @@ function withConfigEnv<A, E, R>(env: Record<string, string>, effect: () => Effec
 }
 
 describe("ModelResolver", () => {
+  it.effect("adds native Anthropic OAuth inference headers after protocol and request betas", () =>
+    Effect.gen(function* () {
+      for (const packageName of ["@opencode/ai/providers/anthropic", "@opencode/ai/providers/anthropic-compatible"]) {
+        const source = Object.freeze({ "X-API-Key": "stale-key", "Anthropic-Beta": "catalog-beta" })
+        const catalog = model(packageName, {
+          providerID: Provider.ID.make("anthropic"),
+          settings: { baseURL: "https://anthropic.example/v1", apiKey: "configured-key" },
+          headers: source,
+        })
+        const resolved = yield* ModelResolver.fromCatalogModel(
+          catalog,
+          Credential.OAuth.make({
+            type: "oauth",
+            methodID: Integration.MethodID.make("anthropic-oauth"),
+            access: "selected-token",
+            refresh: "fixture-refresh",
+            expires: 1,
+          }),
+        )
+        for (const beta of ["request-beta", " request-beta, oauth-2025-04-20, oauth-2025-04-20 "]) {
+          const request = ai.request({
+            model: resolved,
+            prompt: "Hello",
+            http: { headers: { "X-API-Key": "request-key", "Anthropic-Beta": beta, "x-trace": "preserved" } },
+          })
+          const body = yield* resolved.route.body.from(request)
+          const prepared = yield* resolved.route.prepareTransport(body, request)
+          expect(prepared.request.headers.authorization).toBe("Bearer selected-token")
+          expect(prepared.request.headers["x-api-key"]).toBeUndefined()
+          expect(prepared.request.headers["anthropic-beta"].split(",")).toEqual(
+            expect.arrayContaining(["request-beta", "interleaved-thinking-2025-05-14", "oauth-2025-04-20"]),
+          )
+          expect(
+            prepared.request.headers["anthropic-beta"].split(",").filter((item: string) => item === "oauth-2025-04-20"),
+          ).toHaveLength(1)
+          expect(prepared.request.headers["x-trace"]).toBe("preserved")
+          expect(request.http?.headers).toEqual({
+            "X-API-Key": "request-key",
+            "Anthropic-Beta": beta,
+            "x-trace": "preserved",
+          })
+        }
+        expect(catalog.headers).toEqual(source)
+        expect(source).toEqual({ "X-API-Key": "stale-key", "Anthropic-Beta": "catalog-beta" })
+      }
+    }),
+  )
+
+  it.effect("keeps API keys, other OAuth methods and non-Anthropic packages outside Anthropic OAuth auth", () =>
+    Effect.gen(function* () {
+      for (const [packageName, method] of [
+        ["@opencode/ai/providers/anthropic", "key"],
+        ["@opencode/ai/providers/anthropic", "azure-cli"],
+        ["@opencode/ai/providers/openai", "anthropic-oauth"],
+      ] as const) {
+        const credential =
+          method === "key"
+            ? Credential.Key.make({ type: "key", key: "selected-key" })
+            : Credential.OAuth.make({
+                type: "oauth",
+                methodID: Integration.MethodID.make(method),
+                access: "selected-token",
+                refresh: "fixture-refresh",
+                expires: 1,
+              })
+        const resolved = yield* ModelResolver.fromCatalogModel(
+          model(packageName, {
+            settings: { baseURL: "https://provider.example/v1" },
+          }),
+          credential,
+        )
+        const headers = yield* resolved.route.auth.apply({
+          request: ai.request({ model: resolved, prompt: "Hello" }),
+          method: "POST",
+          url: "https://provider.example/v1/messages",
+          body: "{}",
+          headers: Headers.fromInput({ "X-API-Key": "inherited-key", "Anthropic-Beta": "existing-beta" }),
+        })
+        expect(headers["anthropic-beta"]).toBe("existing-beta")
+        expect(headers["x-api-key"]).toBe(method === "key" ? "selected-key" : "inherited-key")
+        if (method === "key") expect(headers.authorization).toBeUndefined()
+        else expect(headers.authorization).toBe("Bearer selected-token")
+      }
+    }),
+  )
+
   it.effect("constructs native Azure requests with deployment IDs and projected resource URLs", () =>
     Effect.gen(function* () {
       const responses = yield* ModelResolver.fromCatalogModel(
@@ -419,7 +507,9 @@ describe("ModelResolver", () => {
       },
       model: () => Effect.die("unused"),
     })
-    const layer = ModelResolver.layer.pipe(Layer.provide(Layer.mergeAll(providers, models, integrations, npm, aisdk)))
+    const layer = ModelResolver.layer.pipe(
+      Layer.provide(Layer.mergeAll(providers, models, integrations, npm, aisdk, LayerNode.compile(AccountPool.node))),
+    )
 
     return withConfigEnv({}, () =>
       Effect.gen(function* () {
@@ -788,7 +878,9 @@ describe("ModelResolver", () => {
 
         expect(azure.route.endpoint.baseURL).toBe("https://cli-resource.openai.azure.com/openai/v1")
         expect((yield* authorize(azure))["api-key"]).toBe("azure-cli")
-        expect((yield* authorize(foundry)).authorization).toBe("Bearer azure-cli")
+        const foundryHeaders = yield* authorize(foundry)
+        expect(foundryHeaders.authorization).toBe("Bearer azure-cli")
+        expect(foundryHeaders["anthropic-beta"]).toBeUndefined()
       }),
     ),
   )

@@ -124,6 +124,8 @@ import type {
   ExperimentalVoiceModelsOutput,
   ExperimentalVoiceSessionInput,
   ExperimentalVoiceSessionOutput,
+  ProviderPoolInput,
+  ProviderPoolOutput,
   ProviderListInput,
   ProviderListOutput,
   ProviderGetInput,
@@ -988,6 +990,13 @@ const adaptGroupExperimentalVoice = (raw: RawClient["server.voice"]) => ({
   session: EndpointExperimentalVoiceSession(raw),
 })
 
+const EndpointProviderPool = (raw: RawClient["server.provider"]) => (input: ProviderPoolInput) =>
+  preserveEffect<ProviderPoolOutput>()(
+    raw["provider.pool"]({ params: { providerID: input["providerID"] }, query: { location: input["location"] } }).pipe(
+      Effect.mapError(mapClientError),
+    ),
+  )
+
 const EndpointProviderList = (raw: RawClient["server.provider"]) => (input?: ProviderListInput) =>
   preserveEffect<ProviderListOutput>()(
     raw["provider.list"]({ query: { location: input?.["location"] } }).pipe(Effect.mapError(mapClientError)),
@@ -1001,6 +1010,7 @@ const EndpointProviderGet = (raw: RawClient["server.provider"]) => (input: Provi
   )
 
 const adaptGroupProvider = (raw: RawClient["server.provider"]) => ({
+  pool: EndpointProviderPool(raw),
   list: EndpointProviderList(raw),
   get: EndpointProviderGet(raw),
 })

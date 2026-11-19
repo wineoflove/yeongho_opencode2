@@ -162,16 +162,14 @@ export function layer(ref: Location.Ref, options: Options = {}): Layer.Layer<Ser
 
   return LayerNode.compile(graph, { replacements, shared: Node.tags.values.global }).pipe(
     // A missing directory is expected; other instance boot failures remain defects.
-    Layer.catchCause(
-      (cause): Layer.Layer<Services, Error> =>
-        Layer.unwrap(
-          Effect.failCause(cause).pipe(
-            Effect.catch(
-              (error): Effect.Effect<never, Error> =>
-                error instanceof FileSystem.DirectoryNotFoundError ? Effect.fail(error) : Effect.die(error),
-            ),
+    Layer.catchCause((cause): Layer.Layer<Services, Error> =>
+      Layer.unwrap(
+        Effect.failCause(cause).pipe(
+          Effect.catch((error): Effect.Effect<never, Error> =>
+            error instanceof FileSystem.DirectoryNotFoundError ? Effect.fail(error) : Effect.die(error),
           ),
         ),
+      ),
     ),
     Layer.tap((context) => Effect.addFinalizer(() => Context.get(context, LocationLifecycle.Service).shutdown)),
     Layer.tap(() =>

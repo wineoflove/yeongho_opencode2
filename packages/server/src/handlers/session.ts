@@ -3,6 +3,9 @@ import { Session } from "@opencode/core/session"
 import { SessionStats } from "@opencode/core/session/stats"
 import { SessionTitle } from "@opencode/core/session/title"
 import { SessionTransfer } from "@opencode/core/session/transfer"
+import { appendSessionReport } from "@opencode/core/session/report"
+import { Bus } from "@opencode/core/bus"
+import { Database } from "@opencode/core/database/database"
 import { InstructionEntry } from "@opencode/core/session/instruction-entry"
 import { Form } from "@opencode/core/form"
 import { DateTime, Effect, Stream } from "effect"
@@ -37,6 +40,8 @@ function missingForm(id: Form.ID) {
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
+    const reportBus = yield* Bus.Service
+    const reportDatabase = yield* Database.Service
     const transfer = yield* SessionTransfer.Service
     const instructions = yield* InstructionEntry.Service
     const instances = yield* Instance.Service
@@ -115,6 +120,31 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
                   : { parentID: ctx.payload.parentID }),
               })
               .pipe(Effect.catchTag("Session.NotFoundError", missingSession)),
+          }
+        }),
+      )
+      .handle(
+        "session.report",
+        Effect.fn(function* (ctx) {
+          return {
+            data: yield* appendSessionReport({
+              sessionID: ctx.params.sessionID,
+              messageID: ctx.payload.messageID,
+              text: ctx.payload.text,
+            }).pipe(
+              Effect.provideService(Session.Service, session),
+              Effect.provideService(Bus.Service, reportBus),
+              Effect.provideService(Database.Service, reportDatabase),
+              Effect.catchTag("Session.NotFoundError", missingSession),
+              Effect.catchTag(
+                "Session.ReportConflictError",
+                (error) =>
+                  new ConflictError({
+                    resource: error.messageID,
+                    message: "Report ID conflicts with existing content",
+                  }),
+              ),
+            ),
           }
         }),
       )

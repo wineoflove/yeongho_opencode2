@@ -1,6 +1,7 @@
 export * as SessionContext from "./context.js"
 
 import { Model } from "../model.js"
+import type { ModelResolver } from "../model-resolver.js"
 import { Permission } from "../permission.js"
 import { Context, Effect, Layer } from "effect"
 import { Agent } from "../agent.js"
@@ -54,6 +55,7 @@ export interface Interface {
   readonly load: (selection: Selection) => Effect.Effect<Loaded, SessionRunnerModel.Error>
   readonly resolveModel: (
     session: SessionSchema.Info,
+    options?: ModelResolver.ResolutionOptions,
   ) => Effect.Effect<SessionRunnerModel.Resolved, SessionRunnerModel.Error>
   /** Selects auxiliary title capabilities without instruction or tool preflight. */
   readonly selectTitle: (session: SessionSchema.Info) => Effect.Effect<
@@ -89,12 +91,14 @@ const layer = Layer.effect(
     const store = yield* SessionStore.Service
     const registry = yield* Tool.Service
 
-    const resolveModel = (session: SessionSchema.Info) => models.resolve(session, model.available)
+    const resolveModel = (session: SessionSchema.Info, options?: ModelResolver.ResolutionOptions) =>
+      models.resolve(session, model.available, options)
 
     const selectTitle = Effect.fn("SessionContext.selectTitle")(function* (session: SessionSchema.Info) {
       const agent = yield* agents.get(Agent.ID.make("title"))
       if (!agent) return
-      const primary = yield* resolveModel(session).pipe(Effect.orElseSucceed(() => undefined))
+      const previewOptions = { useAccountPool: true, advanceAccountPool: false } as const
+      const primary = yield* resolveModel(session, previewOptions).pipe(Effect.orElseSucceed(() => undefined))
       const candidate = yield* Effect.gen(function* () {
         if (agent.model) {
           const info = yield* model.get(agent.model.providerID, agent.model.id)
@@ -110,14 +114,17 @@ const layer = Layer.effect(
       })
       const preferred =
         candidate &&
-        (yield* resolveModel({
-          ...session,
-          model: Model.Ref.make({
-            providerID: candidate.info.providerID,
-            id: candidate.info.id,
-            ...(candidate.variant ? { variant: candidate.variant } : {}),
-          }),
-        }).pipe(Effect.orElseSucceed(() => undefined)))
+        (yield* resolveModel(
+          {
+            ...session,
+            model: Model.Ref.make({
+              providerID: candidate.info.providerID,
+              id: candidate.info.id,
+              ...(candidate.variant ? { variant: candidate.variant } : {}),
+            }),
+          },
+          previewOptions,
+        ).pipe(Effect.orElseSucceed(() => undefined)))
       const selected = preferred ?? primary
       if (!selected) return
       return { agent, primary, selected }
@@ -166,17 +173,20 @@ const layer = Layer.effect(
     })
 
     const load = Effect.fn("SessionContext.load")(function* (selection: Selection) {
-      const model = yield* resolveModel(selection.session)
+      const resolved = yield* models.resolve(selection.session, model.available, {
+        useAccountPool: true,
+        advanceAccountPool: false,
+      })
       const history = yield* SessionHistory.entriesForRunner(
         db,
         selection.session.id,
         selection.instructions,
-        model.ref,
+        resolved.ref,
       )
       return {
         session: selection.session,
         agent: selection.agent,
-        model,
+        model: resolved,
         initial: history.initial,
         messages: history.entries.map((entry) => entry.message),
         tools: selection.tools,

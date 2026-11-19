@@ -7,6 +7,8 @@ import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import type { Server, ServerResponse } from "node:http"
 import { App } from "../../app.js"
 import { Credential } from "../../credential.js"
+import { credentialRequestError } from "../../credential-request-error.js"
+import { requestUsesOAuth } from "../../request-auth.js"
 import { Bus } from "../../bus.js"
 import { Integration } from "../../integration.js"
 // import { IntegrationConnection } from "../../integration/connection.js"
@@ -212,6 +214,9 @@ export const ChatGPTPlugin = define({
   effect: Effect.fn(function* (ctx) {
     const bus = yield* Bus.Service
     const credentials = yield* Credential.Service
+    const catalog = yield* Provider.Service
+    const modelsService = yield* Model.Service
+    let catalogAuth: Provider.CatalogAuth = { integrationID, sourceKey: null, method: null }
     const loading = Semaphore.makeUnsafe(1)
     let chatgpt: Credential.OAuth | undefined
     // let available: ReadonlyArray<RemoteModel> | undefined
@@ -220,9 +225,20 @@ export const ChatGPTPlugin = define({
     const load = Effect.fn("ChatGPTPlugin.load")(function* () {
       // const previous = IntegrationConnection.key(source)
       const connection = yield* ctx.integration.connection.active(integrationID)
-      const credential = connection
-        ? yield* ctx.integration.connection.resolve(connection).pipe(Effect.orElseSucceed(() => undefined))
-        : undefined
+      const credential =
+        connection?.type === "credential"
+          ? (yield* credentials.get(Credential.ID.make(connection.id)))?.value
+          : undefined
+      catalogAuth = {
+        integrationID,
+        sourceKey:
+          connection?.type === "credential"
+            ? `credential:${connection.id}`
+            : connection?.type === "env"
+              ? `env:${connection.name}`
+              : null,
+        method: credential?.type === "oauth" ? credential.methodID : null,
+      }
       chatgpt = credential?.type === "oauth" && credential.methodID === methodID ? credential : undefined
       source = chatgpt ? connection : undefined
       // if (previous !== IntegrationConnection.key(source)) {
@@ -261,8 +277,12 @@ export const ChatGPTPlugin = define({
     yield* ctx.session.hook(
       "retry",
       (event) =>
-        Effect.sync(() => {
-          if (!chatgpt || !nonRetryableSharingCodes.some((code) => event.error.response?.body.includes(code))) return
+        Effect.gen(function* () {
+          if (
+            !(yield* requestUsesOAuth([methodID], chatgpt !== undefined)) ||
+            !nonRetryableSharingCodes.some((code) => event.error.response?.body.includes(code))
+          )
+            return
           event.decision = { retry: false }
         }),
       { providerID },
@@ -271,7 +291,7 @@ export const ChatGPTPlugin = define({
       "model.request",
       (evt) =>
         Effect.gen(function* () {
-          if (!chatgpt) return
+          if (!(yield* requestUsesOAuth([methodID], chatgpt !== undefined))) return
           const session = yield* ctx.session
             .get({ sessionID: evt.sessionID })
             .pipe(Effect.orElseSucceed(() => undefined))
@@ -284,7 +304,8 @@ export const ChatGPTPlugin = define({
     )
     // Config applies after provider plugins, so read it here: a custom baseURL may not decode zstd.
     const configured = yield* configuredSettings(providerID)
-    yield* ctx.provider.transform((providers) => {
+    yield* catalog.transform((providers) => {
+      providers.bindCatalogAuth(providerID, catalogAuth)
       const item = providers.get(providerID)
       if (!item) return
       if (!chatgpt || !source) return
@@ -305,13 +326,14 @@ export const ChatGPTPlugin = define({
         //   ? deriveModels(available, Array.from(item.models.values()))
         //   : Array.from(item.models.values()).filter((model) => fallbackModels.has(model.id)),
         models: Array.from(item.models.values()).filter((model) => fallbackModels.has(model.id)),
-        sourceConnection: source,
+        sourceConnection: source.type === "credential" ? { ...source, id: Credential.ID.make(source.id) } : source,
       })
     })
-    yield* ctx.model.transform((models) => {
+    yield* modelsService.transform((models) => {
+      const method = models.provider.get(providerID)?.catalogAuth?.method
       for (const model of models.list(providerID)) {
         models.update(model.providerID, model.id, (draft) => {
-          if (!chatgpt) return
+          if (method !== methodID) return
           draft.compatibility = { ...draft.compatibility, supportsEffortUpdates: false }
           // Token sharing does not support native /responses/compact.
           draft.settings = { ...draft.settings, compaction: { type: "summary" } }
@@ -359,8 +381,10 @@ export const ChatGPTPlugin = define({
     // })
     const reload = () => loading.withPermit(load().pipe(Effect.andThen(ctx.provider.reload())))
     // .pipe(Effect.andThen(refreshModels().pipe(Effect.forkScoped, Effect.asVoid)))
-    yield* bus.subscribe(Credential.Event.Switched).pipe(
-      Stream.filter((event) => event.data.integrationID === integrationID),
+    yield* bus.subscribe([Credential.Event.Switched, Credential.Event.Updated]).pipe(
+      Stream.filter(
+        (event) => event.type === Credential.Event.Updated.type || event.data.integrationID === integrationID,
+      ),
       Stream.runForEach(reload),
       Effect.forkScoped({ startImmediately: true }),
     )
@@ -485,7 +509,7 @@ function request<A>(url: string, init: RequestInit) {
   return Effect.tryPromise({
     try: async (signal) => {
       const response = await fetch(url, { ...init, signal })
-      if (!response.ok) throw new Error(`Request failed: ${response.status}`)
+      if (!response.ok) throw await credentialRequestError(response)
       return response.json() as Promise<A>
     },
     catch: (cause) => cause,

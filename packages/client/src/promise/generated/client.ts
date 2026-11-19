@@ -118,6 +118,8 @@ import type {
   ExperimentalVoiceModelsOutput,
   ExperimentalVoiceSessionInput,
   ExperimentalVoiceSessionOutput,
+  ProviderPoolInput,
+  ProviderPoolOutput,
   ProviderListInput,
   ProviderListOutput,
   ProviderGetInput,
@@ -1766,6 +1768,18 @@ export function make(options: ClientOptions) {
         ),
     },
     provider: {
+      pool: (input: ProviderPoolInput, requestOptions?: RequestOptions) =>
+        request<ProviderPoolOutput>(
+          {
+            method: "GET",
+            path: `/api/provider/${encodeURIComponent(input.providerID)}/pool`,
+            query: { location: input["location"] },
+            successStatus: 200,
+            declaredStatuses: [400, 401, 404, 503],
+            empty: false,
+          },
+          requestOptions,
+        ),
       list: (input?: ProviderListInput, requestOptions?: RequestOptions) =>
         request<ProviderListOutput>(
           {

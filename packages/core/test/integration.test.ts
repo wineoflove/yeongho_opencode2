@@ -19,6 +19,7 @@ const failingCredentialNode = makeGlobalNode({
     Credential.Service,
     Credential.Service.of({
       lock: () => Effect.die("unused Credential.lock"),
+      commitRefresh: () => Effect.die("unused Credential.commitRefresh"),
       all: () => Effect.succeed([]),
       list: () => Effect.succeed([]),
       get: () => Effect.undefined,

@@ -101,11 +101,7 @@ export interface EnvImplementation {
 }
 
 export type Implementation =
-  | OAuthImplementation
-  | CommandImplementation
-  | KeyImplementation
-  | ExternalImplementation
-  | EnvImplementation
+  OAuthImplementation | CommandImplementation | KeyImplementation | ExternalImplementation | EnvImplementation
 
 export const Attempt = Integration.Attempt
 export type Attempt = Integration.Attempt
@@ -137,6 +133,15 @@ export class AttemptNotFoundError extends Schema.TaggedError<AttemptNotFoundErro
   integrationID: ID,
   attemptID: AttemptID,
 }) {}
+
+export class OAuthRefreshUnavailableError extends Schema.TaggedError<OAuthRefreshUnavailableError>()(
+  "Integration.OAuthRefreshUnavailable",
+  {},
+) {
+  override get message() {
+    return "This OAuth connection requires renewal but its authentication method cannot refresh it"
+  }
+}
 
 export type Error = CodeRequiredError | AuthorizationError | AttemptNotFoundError
 
@@ -756,7 +761,8 @@ const layer = Layer.effect(
             Clock.currentTimeMillis.pipe(
               Effect.map((now) => value.expires <= now + Duration.toMillis(Duration.minutes(5))),
             )
-          if (!refresh || !(yield* expiring(credential.value))) return credential.value
+          if (!(yield* expiring(credential.value))) return credential.value
+          if (!refresh) return yield* new AuthorizationError({ cause: new OAuthRefreshUnavailableError() })
           return yield* authorize(
             credentials.lock(
               credential.id,
@@ -766,7 +772,7 @@ const layer = Layer.effect(
                 if (!current || current.value.type !== "oauth") return undefined
                 if (!(yield* expiring(current.value))) return current.value
                 const value = yield* refresh(current.value).pipe(Effect.timeout("30 seconds"))
-                yield* credentials.update(current.id, { value })
+                yield* credentials.commitRefresh(current, value)
                 return value
               }),
             ),

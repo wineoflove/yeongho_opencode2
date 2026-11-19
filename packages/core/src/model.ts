@@ -75,12 +75,18 @@ export interface Editor {
 }
 
 export interface Interface extends State.Transformable<Editor> {
+  readonly catalog: (providerID: Provider.ID, modelID: ID) => Effect.Effect<CatalogEntry | undefined>
   readonly get: (providerID: Provider.ID, modelID: ID) => Effect.Effect<Info | undefined>
   readonly all: () => Effect.Effect<readonly Info[]>
   /** Enabled models of the given types, chat when none are given. Only chat models are offered for sessions. */
   readonly available: (types?: readonly Model.Type[]) => Effect.Effect<readonly Info[]>
   readonly default: () => Effect.Effect<Info | undefined>
   readonly small: (providerID: Provider.ID) => Effect.Effect<Info | undefined>
+}
+
+export interface CatalogEntry {
+  readonly model: Info
+  readonly definition: Provider.Definition
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Model") {}
@@ -175,6 +181,7 @@ const layer = Layer.effect(
     let cached:
       | {
           data: Data
+          snapshot: Provider.Snapshot
           all: readonly Info[]
           available: readonly Info[]
           other: ReadonlyMap<Model.Type, readonly Info[]>
@@ -246,7 +253,14 @@ const layer = Layer.effect(
           .sort((left, right) => right.time.released - left.time.released)
         other.forEach((models) => models.sort((left, right) => right.time.released - left.time.released))
         cached = freeze(
-          { data, all, available: preferFree(all.filter((model) => model.enabled)), other, byProvider },
+          {
+            data,
+            snapshot: current,
+            all,
+            available: preferFree(all.filter((model) => model.enabled)),
+            other,
+            byProvider,
+          },
           true,
         )
         return cached
@@ -282,6 +296,15 @@ const layer = Layer.effect(
     return Service.of({
       transform: (update) => prepare.pipe(Effect.andThen(state.transform(update))),
       reload,
+      catalog: Effect.fn("Model.catalog")((providerID, modelID) =>
+        read().pipe(
+          Effect.map((value) => {
+            const model = value.byProvider.get(providerID)?.get(modelID)
+            const definition = value.snapshot.available.find((record) => record.provider.id === providerID)
+            return model?.enabled && definition ? { model, definition } : undefined
+          }),
+        ),
+      ),
       get: Effect.fn("Model.get")((providerID, modelID) =>
         read().pipe(Effect.map((value) => value.byProvider.get(providerID)?.get(modelID))),
       ),

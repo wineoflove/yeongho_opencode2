@@ -7,6 +7,7 @@ import { Session } from "@opencode/schema/session"
 import type { SessionRequestKind } from "@opencode/plugin/effect/session"
 import { Location } from "@opencode/core/location"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
+import { requestUsesOAuth, withRequestAuth } from "@opencode/core/request-auth"
 import { Project } from "@opencode/core/project"
 import { AbsolutePath } from "@opencode/core/schema"
 import { SessionModelRequest } from "@opencode/core/session/model-request"
@@ -46,12 +47,14 @@ describe("SessionModelRequest HTTP hooks", () => {
       const hooks = yield* PluginHooks.Service
       const seen: Array<{ hook: string; kind: SessionRequestKind; agent: Agent.ID }> = []
       yield* hooks.register("session", "http.request", (event) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          expect(yield* requestUsesOAuth(["chatgpt-token-sharing"], false)).toBe(true)
           seen.push({ hook: "request", kind: event.kind, agent: event.agent })
         }),
       )
       yield* hooks.register("session", "http.response", (event) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          expect(yield* requestUsesOAuth(["chatgpt-token-sharing"], false)).toBe(true)
           seen.push({ hook: "response", kind: event.kind, agent: event.agent })
         }),
       )
@@ -61,14 +64,17 @@ describe("SessionModelRequest HTTP hooks", () => {
         const prepared = yield* requests[kind]({
           session,
           agent: Agent.ID.make("build"),
-          model,
+          model: { ...model, requestAuth: { integrationID: "openai", method: "chatgpt-token-sharing" } },
           system: [],
           messages: [],
         })
         const http = prepared.options.http
         if (!http) throw new Error(`Expected HTTP middleware for ${kind}`)
-        yield* http(HttpClientRequest.post("https://example.test/v1/chat/completions"), (request) =>
-          Effect.succeed(HttpClientResponse.fromWeb(request, new Response("{}", { status: 200 }))),
+        yield* withRequestAuth(
+          http(HttpClientRequest.post("https://example.test/v1/chat/completions"), (request) =>
+            Effect.succeed(HttpClientResponse.fromWeb(request, new Response("{}", { status: 200 }))),
+          ),
+          { integrationID: "openai", method: "chatgpt-headless" },
         )
       }
 
@@ -146,14 +152,12 @@ describe("SessionModelRequest HTTP hooks", () => {
       }
 
       const required = yield* Effect.forEach([1, 2], () =>
-        requests
-          .primary({ session, agent: Agent.ID.make("build"), model, system: [], messages: [], tools })
-          .pipe(
-            Effect.map((prepared) => {
-              const tool = prepared.request.tools[0]
-              return tool?.type === "tool" ? tool.inputSchema.required : undefined
-            }),
-          ),
+        requests.primary({ session, agent: Agent.ID.make("build"), model, system: [], messages: [], tools }).pipe(
+          Effect.map((prepared) => {
+            const tool = prepared.request.tools[0]
+            return tool?.type === "tool" ? tool.inputSchema.required : undefined
+          }),
+        ),
       )
 
       expect(required).toEqual([
@@ -170,20 +174,23 @@ describe("SessionModelRequest HTTP hooks", () => {
       const seen: string[] = []
       yield* hooks.register("session", "http.request", () => Effect.sync(() => void seen.push("http.request")))
       yield* hooks.register("session", "experimental.ws.handshake", (event) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          expect(yield* requestUsesOAuth(["chatgpt-token-sharing"], false)).toBe(true)
           seen.push(`handshake:${event.kind}:${event.url}`)
           event.headers.authorization = "Bearer minted"
           delete event.headers["api-key"]
         }),
       )
       yield* hooks.register("session", "experimental.ws.send", (event) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          expect(yield* requestUsesOAuth(["chatgpt-token-sharing"], false)).toBe(true)
           seen.push(`send:${event.kind}:${event.frame}`)
           event.frame = `${event.frame}+plugin`
         }),
       )
       yield* hooks.register("session", "experimental.ws.receive", (event) =>
-        Effect.sync(() => {
+        Effect.gen(function* () {
+          expect(yield* requestUsesOAuth(["chatgpt-token-sharing"], false)).toBe(true)
           seen.push(`receive:${event.kind}:${event.frame}`)
           event.frame = event.frame.toUpperCase()
         }),
@@ -214,12 +221,15 @@ describe("SessionModelRequest HTTP hooks", () => {
       const prepared = yield* requests.primary({
         session,
         agent: Agent.ID.make("build"),
-        model: SessionRunnerModel.resolved(OpenAIChat.route.model({ id: "gpt-5.5", provider: "test" }), {
-          capabilities: { tools: true, input: ["text"], output: ["text"] },
-          cost: [],
-          limit: { context: 200_000, output: 32_000 },
-          transport: "websocket",
-        }),
+        model: {
+          ...SessionRunnerModel.resolved(OpenAIChat.route.model({ id: "gpt-5.5", provider: "test" }), {
+            capabilities: { tools: true, input: ["text"], output: ["text"] },
+            cost: [],
+            limit: { context: 200_000, output: 32_000 },
+            transport: "websocket",
+          }),
+          requestAuth: { integrationID: "openai", method: "chatgpt-token-sharing" },
+        },
         system: [],
         messages: [],
         webSocket: "session",
@@ -227,7 +237,10 @@ describe("SessionModelRequest HTTP hooks", () => {
 
       expect(prepared.options.http).toBeDefined()
       expect(prepared.options.webSocket).toBeDefined()
-      yield* prepared.options.webSocket!.execute({} as never)
+      yield* withRequestAuth(prepared.options.webSocket!.execute({} as never), {
+        integrationID: "openai",
+        method: "chatgpt-headless",
+      })
       expect(bound).toEqual([{ url: "wss://example.test/v1/responses", headers: { authorization: "Bearer minted" } }])
       expect(frames).toEqual(["create+plugin", "CREATED"])
       expect(seen).toEqual([

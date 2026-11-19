@@ -1,6 +1,7 @@
 export * as Credential from "./credential.js"
 
 import { asc, desc, eq } from "drizzle-orm"
+import { isDeepStrictEqual } from "node:util"
 import { Cause, Context, Effect, Fiber, Layer, Schema } from "effect"
 import { Credential } from "@opencode/schema/credential"
 import { CredentialLegacy } from "@opencode/schema/credential-legacy"
@@ -36,6 +37,14 @@ export class Info extends Schema.Class<Info>("Credential.Info")({
   value: Value,
 }) {}
 
+export class ChangedError extends Schema.TaggedError<ChangedError>()("Credential.Changed", {
+  credentialID: ID,
+}) {
+  override get message() {
+    return "Credential changed while authentication was being refreshed"
+  }
+}
+
 export interface Interface {
   /** Returns every stored credential. */
   readonly all: () => Effect.Effect<Info[]>
@@ -63,6 +72,7 @@ export interface Interface {
   readonly activate: (id: ID) => Effect.Effect<void>
   /** Updates the label or secret value of a stored credential. */
   readonly update: (id: ID, updates: Partial<Pick<Info, "label" | "value">>) => Effect.Effect<void>
+  readonly commitRefresh: (expected: Info, value: OAuth) => Effect.Effect<void, ChangedError>
   /** Removes a stored credential. */
   readonly remove: (id: ID) => Effect.Effect<void>
 }
@@ -233,10 +243,42 @@ const layer = Layer.effect(
           yield* bus.publish(Event.Switched, { integrationID, credentialID: id }, { global: true })
         }
       }),
+      commitRefresh: Effect.fn("Credential.commitRefresh")(function* (expected, value) {
+        if (expected.value.type !== "oauth" || value.methodID !== expected.value.methodID)
+          return yield* new ChangedError({ credentialID: expected.id })
+        const changed = yield* db
+          .transaction(
+            (tx) =>
+              Effect.gen(function* () {
+                const row = yield* tx.select().from(CredentialTable).where(eq(CredentialTable.id, expected.id)).get()
+                if (
+                  !row ||
+                  row.integration_id !== expected.integrationID ||
+                  !isDeepStrictEqual(decode(row.value), expected.value)
+                )
+                  return yield* new ChangedError({ credentialID: expected.id })
+                yield* tx.update(CredentialTable).set({ value }).where(eq(CredentialTable.id, expected.id)).run()
+                return !isDeepStrictEqual(expected.value.metadata, value.metadata)
+              }),
+            { behavior: "immediate" },
+          )
+          .pipe(
+            Effect.catch((error) =>
+              error instanceof ChangedError
+                ? Effect.fail(error)
+                : Effect.die(new Error("Credential refresh persistence failed")),
+            ),
+          )
+        if (changed) yield* bus.publish(Event.Updated, {}, { global: true })
+      }),
       update: Effect.fn("Credential.update")(function* (id, updates) {
         if (updates.label === undefined && updates.value === undefined) return
         const credential = yield* db
-          .select({ integrationID: CredentialTable.integration_id, label: CredentialTable.label })
+          .select({
+            integrationID: CredentialTable.integration_id,
+            label: CredentialTable.label,
+            value: CredentialTable.value,
+          })
           .from(CredentialTable)
           .where(eq(CredentialTable.id, id))
           .get()
@@ -280,7 +322,15 @@ const layer = Layer.effect(
           valueChanged: updates.value !== undefined,
           labelChanged: updates.label !== undefined && updates.label !== credential.label,
         })
-        if (updates.label !== undefined && updates.label !== credential.label)
+        const authIdentity = (value: Value) => ({
+          type: value.type,
+          method: "methodID" in value ? value.methodID : undefined,
+          metadata: "metadata" in value ? value.metadata : undefined,
+        })
+        const identityChanged =
+          updates.value !== undefined &&
+          !isDeepStrictEqual(authIdentity(decode(credential.value)), authIdentity(updates.value))
+        if (identityChanged || (updates.label !== undefined && updates.label !== credential.label))
           yield* bus.publish(Event.Updated, {}, { global: true })
       }),
       remove: Effect.fn("Credential.remove")(function* (id) {

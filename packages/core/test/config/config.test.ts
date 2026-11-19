@@ -904,6 +904,7 @@ describe("Config", () => {
               Credential.Service.of({
                 lock: () => Effect.die("unused Credential.lock"),
                 all: () => Effect.die("unused Credential.all"),
+                commitRefresh: () => Effect.die("unused Credential.commitRefresh"),
                 list: () =>
                   Effect.succeed([
                     new Credential.Info({
@@ -1154,6 +1155,7 @@ describe("Config", () => {
               Credential.Service.of({
                 lock: () => Effect.die("unused Credential.lock"),
                 all: () => Effect.die("unused Credential.all"),
+                commitRefresh: () => Effect.die("unused Credential.commitRefresh"),
                 list: () =>
                   Effect.succeed([
                     new Credential.Info({

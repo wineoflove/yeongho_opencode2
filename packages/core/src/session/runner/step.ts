@@ -28,6 +28,9 @@ import { SessionUsage } from "../usage.js"
 import { SessionRunnerModel } from "./model.js"
 import { createLLMEventPublisher } from "./publish-llm-event.js"
 import { SessionRunnerRetry } from "./retry.js"
+import { AccountPool } from "../../account-pool.js"
+import { Integration } from "../../integration.js"
+import { AccountPoolFailure } from "../../account-pool-failure.js"
 
 export type Outcome = Data.TaggedEnum<{
   Completed: { readonly needsContinuation: boolean }
@@ -69,8 +72,10 @@ export const make = Effect.gen(function* () {
   const llm = yield* LLMClient.Service
   const snapshots = yield* Snapshot.Service
   const toolOutput = yield* ToolOutput.Service
+  const pools = Option.getOrUndefined(yield* Effect.serviceOption(AccountPool.Service))
 
   const attempt = Effect.fn("SessionStep.attempt")(function* (input: Input) {
+    const toolScope = yield* Effect.scope
     // The start snapshot only has to exist before local tools run, which cannot happen before Step.Started,
     // so it is captured while the provider request is in flight instead of delaying it.
     const pendingStartSnapshot = yield* snapshots.capture().pipe(Effect.forkScoped)
@@ -119,6 +124,14 @@ export const make = Effect.gen(function* () {
             return
           }
           yield* publisher.publish(event)
+          if (
+            input.model.accountBinding &&
+            pools &&
+            (LLMEvent.is.stepFinish(event) || LLMEvent.is.finish(event)) &&
+            event.reason.normalized === "content-filter"
+          ) {
+            yield* pools.reportFailure(input.model.accountBinding, "access-denied")
+          }
           if (event.type !== "tool-call" || event.providerExecuted) return
           toolRuns.push({
             call: event,
@@ -130,7 +143,7 @@ export const make = Effect.gen(function* () {
                   publisher.failTool(event.id, toSessionError(error), error.metadata).pipe(Effect.asVoid),
                 ),
               ),
-            ).pipe(Effect.forkScoped),
+            ).pipe(Effect.forkIn(toolScope)),
           })
         }),
       ),
@@ -140,7 +153,36 @@ export const make = Effect.gen(function* () {
     // Keep the final tool and Step events uninterruptible, even when the work itself is cancelled.
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
-        const stream = yield* restore(providerStream).pipe(Effect.exit)
+        const guardedStream = input.model.accountBinding
+          ? pools
+            ? pools.withAccount(
+                input.model.accountBinding,
+                providerStream.pipe(
+                  Effect.tapError((error) =>
+                    error instanceof AIError && input.model.accountBinding
+                      ? pools.reportFailure(
+                          input.model.accountBinding,
+                          AccountPoolFailure.classify(error),
+                          AccountPoolFailure.retryAfterMs(error, input.model.accountBinding.integrationID),
+                        )
+                      : Effect.void,
+                  ),
+                ),
+              )
+            : Effect.fail(
+                new AccountPool.StateUnavailableError({ integrationID: input.model.accountBinding.integrationID }),
+              )
+          : providerStream
+        const stream = yield* restore(guardedStream).pipe(
+          Effect.catchTag("AccountPool.StateUnavailable", (cause) =>
+            Effect.fail(new Integration.AuthorizationError({ cause })),
+          ),
+          Effect.catchTag("AccountPool.Paused", (cause) => Effect.fail(new Integration.AuthorizationError({ cause }))),
+          Effect.catchTag("AccountPool.Unavailable", (cause) =>
+            Effect.fail(new Integration.AuthorizationError({ cause })),
+          ),
+          Effect.exit,
+        )
         const streamFailure = Option.getOrUndefined(Exit.findErrorOption(stream))
         const streamInterrupted = Exit.hasInterrupts(stream)
         // Cancelled before the start snapshot existed: record nothing, as when the capture preceded the request.
@@ -187,7 +229,10 @@ export const make = Effect.gen(function* () {
         )
           return Outcome.RecoverFull()
         const retry =
-          llmFailure && llmError && !isContextOverflowFailure(llmFailure)
+          llmFailure &&
+          llmError &&
+          !isContextOverflowFailure(llmFailure) &&
+          !(input.model.accountBinding && recorded.outputStarted)
             ? yield* restore(
                 input.retry(
                   llmFailure,

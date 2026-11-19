@@ -38,6 +38,7 @@ const memoryCredentials = (initial: Credential.Info[]) => {
   const unused = () => Effect.die("unused credential method")
   const service = Credential.Service.of({
     lock: unused,
+    commitRefresh: unused,
     all: unused,
     create: unused,
     activate: unused,
@@ -167,7 +168,12 @@ describe("MCP OAuth", () => {
       async fetch(request) {
         if (request.method !== "POST" || new URL(request.url).pathname !== "/token")
           return new Response(null, { status: 404 })
-        return Response.json({ access_token: "access", token_type: "Bearer", refresh_token: "refresh", expires_in: 3600 })
+        return Response.json({
+          access_token: "access",
+          token_type: "Bearer",
+          refresh_token: "refresh",
+          expires_in: 3600,
+        })
       },
     })
 
@@ -198,10 +204,7 @@ describe("MCP OAuth", () => {
       fetch(request) {
         if (request.method !== "POST" || new URL(request.url).pathname !== "/token")
           return new Response(null, { status: 404 })
-        return Response.json(
-          { error: "invalid_client", error_description: "bad_client_secret" },
-          { status: 400 },
-        )
+        return Response.json({ error: "invalid_client", error_description: "bad_client_secret" }, { status: 400 })
       },
     })
 

@@ -1,4 +1,5 @@
 export * as SessionRunnerLLM from "./llm.js"
+import { AccountPool } from "../../account-pool.js"
 
 import { Message } from "@opencode/ai/effect"
 import { and, desc, eq, inArray, sql } from "drizzle-orm"
@@ -175,7 +176,9 @@ const layer = Layer.effect(
                 // The Session would go idle; a plugin may admit input to keep this execution working.
                 yield* restore(
                   SessionBackground.outstanding(jobs, store, sessionID).pipe(
-                    Effect.flatMap((background) => hooks.trigger("session", "experimental.idle", { sessionID, background })),
+                    Effect.flatMap((background) =>
+                      hooks.trigger("session", "experimental.idle", { sessionID, background }),
+                    ),
                   ),
                 )
                 if (!(yield* SessionInbox.has(db, sessionID, "input"))) return DrainResult.Complete()
@@ -236,15 +239,16 @@ const layer = Layer.effect(
       let recoverContinuation = true
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
-        const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
+        const candidate = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
-        const estimate = SessionCompaction.estimatePrompt(loaded)
-        const compacted = yield* compaction.compact({ reason: "auto", context: loaded, estimate })
+        const estimate = SessionCompaction.estimatePrompt(candidate)
+        const compacted = yield* compaction.compact({ reason: "auto", context: candidate, estimate })
         if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
         if (compacted.status === "completed") {
           assistantMessageID = SessionMessage.ID.create()
           continue
         }
+        const loaded = { ...candidate, model: yield* context.resolveModel(candidate.session, { useAccountPool: true }) }
         yield* compaction.precompute(Effect.succeed(loaded), estimate)
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
         const transcript = SessionModelRequest.baseTranscript({
@@ -439,6 +443,7 @@ export const node = makeLocationNode({
   service: Service,
   layer,
   deps: [
+    AccountPool.node,
     Bus.node,
     LocationLifecycle.node,
     llmClient,
