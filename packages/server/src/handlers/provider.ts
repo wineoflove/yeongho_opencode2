@@ -5,7 +5,7 @@ import { AccountPool } from "@opencode/core/account-pool"
 import { Integration } from "@opencode/core/integration"
 import { HttpApiBuilder } from "effect/http-api"
 import { Api } from "../api"
-import { awaitPlugins, response } from "../location"
+import { response } from "../location"
 
 export const ProviderHandler = HttpApiBuilder.group(Api, "server.provider", (handlers) =>
   Effect.gen(function* () {
@@ -13,7 +13,6 @@ export const ProviderHandler = HttpApiBuilder.group(Api, "server.provider", (han
       .handle(
         "provider.pool",
         Effect.fn(function* (ctx) {
-          yield* awaitPlugins
           const providers = yield* Provider.Service
           const pools = yield* AccountPool.Service
           const provider = yield* providers.get(ctx.params.providerID)
@@ -49,7 +48,6 @@ export const ProviderHandler = HttpApiBuilder.group(Api, "server.provider", (han
       .handle(
         "provider.list",
         Effect.fn(function* () {
-          yield* awaitPlugins
           const providers = yield* Provider.Service
           return yield* response(providers.available())
         }),

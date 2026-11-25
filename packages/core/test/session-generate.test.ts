@@ -100,6 +100,7 @@ const client = Layer.mock(LLMClient.Service)({
     }),
 })
 const models = Layer.mock(SessionRunnerModel.Service)({
+  select: (session) => Effect.fail(new SessionRunnerModel.ModelNotSelectedError({ sessionID: session.id })),
   resolve: (_session, _available, options) =>
     Effect.succeed({
       ...SessionRunnerModel.resolved(model, {
