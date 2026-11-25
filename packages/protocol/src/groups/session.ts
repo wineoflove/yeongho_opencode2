@@ -400,6 +400,22 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S, FormI ext
         ),
     )
     .add(
+      HttpApiEndpoint.post("session.report", "/api/experimental/session/:sessionID/report", {
+        params: { sessionID: Session.ID },
+        payload: Schema.Struct({ messageID: SessionMessage.ID, text: Schema.String }),
+        success: Schema.Struct({ data: Schema.Struct({ messageID: SessionMessage.ID, reused: Schema.Boolean }) }),
+        error: [ConflictError, SessionNotFoundError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.session.report",
+            summary: "Append session report",
+            description: "Experimental: append an idempotent synthetic report without scheduling model execution.",
+          }),
+        ),
+    )
+    .add(
       HttpApiEndpoint.post("session.synthetic", "/api/session/:sessionID/synthetic", {
         params: { sessionID: Session.ID },
         payload: Schema.Struct({

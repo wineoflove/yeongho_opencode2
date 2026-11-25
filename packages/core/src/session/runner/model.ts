@@ -47,7 +47,7 @@ export interface Interface {
   readonly resolve: (
     session: SessionSchema.Info,
     available: () => Effect.Effect<ReadonlyArray<Model.Info>>,
-    request: { readonly kind: SessionRequestKind; readonly agent: Agent.ID },
+    request: { readonly kind: SessionRequestKind; readonly agent: Agent.ID } & ModelResolver.ResolutionOptions,
   ) => Effect.Effect<Resolved, Error>
 }
 
@@ -121,9 +121,12 @@ const layer = Layer.effect(
           model: ref,
         })).model
         if (model.providerID === ref.providerID && model.id === ref.id && model.variant === ref.variant)
-          return yield* resolver.resolveModel(selected.info, selected.variant)
+          return yield* resolver.resolveModel(selected.info, selected.variant, request)
         // Same provider only: the model may be hidden from the picker, and its credentials and hooks stay the selection's.
-        const resolved = model.providerID === ref.providerID ? yield* resolver.resolve(model) : undefined
+        const resolved =
+          model.providerID === ref.providerID
+            ? yield* resolver.resolve(model, { ...request, allowHiddenModel: true })
+            : undefined
         if (resolved) return resolved
         return yield* new ModelUnavailableError({ providerID: model.providerID, modelID: model.id })
       }),

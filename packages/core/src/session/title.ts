@@ -1,9 +1,9 @@
 export * as SessionTitle from "./title.js"
 
 import { isDeepStrictEqual } from "node:util"
-import { LLMClient, LLMEvent, Message, SystemPart } from "@opencode/ai/effect"
+import { AIError, LLMClient, LLMEvent, Message, SystemPart } from "@opencode/ai/effect"
 import type { Agent } from "@opencode/schema/agent"
-import { Context, DateTime, Effect, Layer, Stream } from "effect"
+import { Context, DateTime, Effect, Layer, Schema, Stream } from "effect"
 import { Database } from "../database/database.js"
 import { Bus } from "../bus.js"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
@@ -13,7 +13,12 @@ import { llmClient } from "../effect/app-node-platform.js"
 import { SessionContext } from "./context.js"
 import { SessionEvent } from "./event.js"
 import { SessionHistory } from "./history.js"
-import type { SessionRunnerModel } from "./runner/model.js"
+import { SessionRunnerModel } from "./runner/model.js"
+import { Model } from "../model.js"
+import { AccountPool } from "../account-pool.js"
+import { AccountPoolFailure } from "../account-pool-failure.js"
+import { Provider } from "../provider.js"
+import { bindRequestModel } from "./request-model-binding.js"
 import { SessionSchema } from "./schema.js"
 import { SessionUsage } from "./usage.js"
 import { SessionStore } from "./store.js"
@@ -22,6 +27,7 @@ const MAX_LENGTH = 100
 const MAX_CONTEXT_LENGTH = 8_000
 const MAX_FIRST_MESSAGE_LENGTH = 2_000
 const titleChanged = Symbol("Session title changed")
+class PoolTitleFailure extends Schema.TaggedError<PoolTitleFailure>()("SessionTitle.PoolFailure", {}) {}
 
 export interface Interface {
   /** Generates an initial title or regenerates one from bounded conversation history. */
@@ -51,6 +57,10 @@ export const layer = Layer.effect(
     const context = yield* SessionContext.Service
     const store = yield* SessionStore.Service
     const db = (yield* Database.Service).db
+    const models = yield* SessionRunnerModel.Service
+    const catalog = yield* Model.Service
+    const pools = yield* AccountPool.Service
+    const providers = yield* Provider.Service
 
     const attempt = Effect.fn("SessionTitle.attempt")(function* (input: {
       readonly session: SessionSchema.Info
@@ -60,6 +70,8 @@ export const layer = Layer.effect(
     }) {
       const chunks: Array<{ id: string; text: string }> = []
       const commentary = new Set<string>()
+      const configuredPool = (yield* providers.get(input.model.ref.providerID))?.settings?.accountPool !== undefined
+      const preview = input.model
       let failed = false
       let usage: SessionUsage.Recorded | undefined
       const recordUsage = Effect.suspend(() =>
@@ -74,13 +86,28 @@ export const layer = Layer.effect(
       const prepared = yield* context.request.title({
         session: input.session,
         agent: input.agent.id,
-        model: input.model,
+        model: preview,
         system: input.agent.system ? [SystemPart.make(input.agent.system)] : [],
         messages: [Message.user(input.text)],
       })
       if (prepared.event.result !== undefined) return prepared.event.result
       const metadataKey = prepared.request.model.route.providerMetadataKey ?? prepared.request.model.provider
-      yield* llm.stream(prepared.request, prepared.options).pipe(
+      const model = configuredPool
+        ? yield* models
+            .resolve({ ...input.session, model: input.model.ref }, catalog.available, {
+              kind: "title",
+              agent: input.agent.id,
+              useAccountPool: true,
+            })
+            .pipe(Effect.mapError(() => new PoolTitleFailure()))
+        : preview
+      if (
+        preview.requestAuth?.integrationID !== model.requestAuth?.integrationID ||
+        preview.requestAuth?.method !== model.requestAuth?.method
+      )
+        return yield* new PoolTitleFailure()
+      const request = configuredPool ? bindRequestModel(prepared.request, model) : prepared.request
+      const operation = llm.stream(request, prepared.options).pipe(
         Stream.runForEach((event) => {
           // Responses can classify a text block only when it ends; filter after the stream completes.
           if (LLMEvent.is.textStart(event) || LLMEvent.is.textDelta(event) || LLMEvent.is.textEnd(event)) {
@@ -90,12 +117,37 @@ export const layer = Layer.effect(
           }
           if (LLMEvent.is.textDelta(event)) chunks.push({ id: event.id, text: event.text })
           if (LLMEvent.is.stepFinish(event)) {
-            const step = SessionUsage.record(event.usage, input.model.cost)
+            const step = SessionUsage.record(event.usage, model.cost)
             usage = usage ? SessionUsage.add(usage, step) : step
+          }
+          if (
+            (LLMEvent.is.stepFinish(event) || LLMEvent.is.finish(event)) &&
+            event.reason.normalized === "content-filter"
+          ) {
+            failed = true
+            if (model.accountBinding) return pools.reportFailure(model.accountBinding, "access-denied")
           }
           return Effect.void
         }),
-        Effect.catchTag("AI.Error", () =>
+      )
+      const guarded = model.accountBinding
+        ? pools.withAccount(
+            model.accountBinding,
+            operation.pipe(
+              Effect.tapError((error) =>
+                error instanceof AIError && model.accountBinding
+                  ? pools.reportFailure(
+                      model.accountBinding,
+                      AccountPoolFailure.classify(error),
+                      AccountPoolFailure.retryAfterMs(error, model.accountBinding.integrationID),
+                    )
+                  : Effect.void,
+              ),
+            ),
+          )
+        : operation
+      yield* guarded.pipe(
+        Effect.catch(() =>
           Effect.sync(() => {
             failed = true
           }),
@@ -103,6 +155,7 @@ export const layer = Layer.effect(
         Effect.onInterrupt(() => recordUsage.pipe(Effect.asVoid)),
       )
       yield* recordUsage
+      if (failed && (configuredPool || model.accountBinding)) return yield* new PoolTitleFailure()
       if (failed) return
       return chunks
         .filter((chunk) => !commentary.has(chunk.id))
@@ -113,56 +166,59 @@ export const layer = Layer.effect(
         .find((line) => line.length > 0)
     })
 
-    const generate = Effect.fn("SessionTitle.generate")(function* (sessionID: SessionSchema.ID) {
-      const session = yield* store.get(sessionID)
-      if (!session) return
-      const firstUser = yield* SessionHistory.firstUserMessage(db, session.id)
-      if (!firstUser) return
-      const text = !isUntitled(session)
-        ? yield* store.context(session.id).pipe(
-            Effect.map((messages) => {
-              const original = `Original request:\n${TextBoundary.head(firstUser.text, MAX_FIRST_MESSAGE_LENGTH)}`
-              const recent = messages
-                .flatMap((message) => {
-                  if (message.type === "user" && message.id !== firstUser.id) return [`User: ${message.text.trim()}`]
-                  if (message.type !== "assistant") return []
-                  const text = message.content
-                    .flatMap((part) => (part.type === "text" ? [part.text.trim()] : []))
-                    .filter(Boolean)
-                    .join("\n")
-                  return text ? [`Assistant: ${text}`] : []
-                })
-                .join("\n\n")
-              if (!recent) return conversationPrompt(original)
-              const prefix = `${original}\n\nRecent conversation:\n`
-              const budget = MAX_CONTEXT_LENGTH - conversationPrompt("").length - prefix.length
-              return conversationPrompt(`${prefix}${TextBoundary.tail(recent, budget)}`)
-            }),
-            Effect.orElseSucceed(() => messagePrompt(firstUser.text)),
+    const generate = Effect.fn("SessionTitle.generate")(
+      function* (sessionID: SessionSchema.ID) {
+        const session = yield* store.get(sessionID)
+        if (!session) return
+        const firstUser = yield* SessionHistory.firstUserMessage(db, session.id)
+        if (!firstUser) return
+        const text = !isUntitled(session)
+          ? yield* store.context(session.id).pipe(
+              Effect.map((messages) => {
+                const original = `Original request:\n${TextBoundary.head(firstUser.text, MAX_FIRST_MESSAGE_LENGTH)}`
+                const recent = messages
+                  .flatMap((message) => {
+                    if (message.type === "user" && message.id !== firstUser.id) return [`User: ${message.text.trim()}`]
+                    if (message.type !== "assistant") return []
+                    const text = message.content
+                      .flatMap((part) => (part.type === "text" ? [part.text.trim()] : []))
+                      .filter(Boolean)
+                      .join("\n")
+                    return text ? [`Assistant: ${text}`] : []
+                  })
+                  .join("\n\n")
+                if (!recent) return conversationPrompt(original)
+                const prefix = `${original}\n\nRecent conversation:\n`
+                const budget = MAX_CONTEXT_LENGTH - conversationPrompt("").length - prefix.length
+                return conversationPrompt(`${prefix}${TextBoundary.tail(recent, budget)}`)
+              }),
+              Effect.orElseSucceed(() => messagePrompt(firstUser.text)),
+            )
+          : messagePrompt(firstUser.text)
+        const selection = yield* context.selectTitle(session)
+        if (!selection) return
+        const title =
+          (yield* attempt({ session, agent: selection.agent, text, model: selection.selected })) ??
+          (selection.primary && !isDeepStrictEqual(selection.selected.ref, selection.primary.ref)
+            ? yield* attempt({ session, agent: selection.agent, text, model: selection.primary })
+            : undefined)
+        if (!title) return
+        const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1
+        const current = yield* store.get(sessionID)
+        if (!current || current.title !== session.title || current.title === truncate(title)) return
+        yield* bus
+          .publish(
+            SessionEvent.Renamed,
+            {
+              sessionID: session.id,
+              title: truncate(title),
+            },
+            { commit: (sequence) => (sequence === expectedSequence ? Effect.void : Effect.die(titleChanged)) },
           )
-        : messagePrompt(firstUser.text)
-      const selection = yield* context.selectTitle(session)
-      if (!selection) return
-      const title =
-        (yield* attempt({ session, agent: selection.agent, text, model: selection.selected })) ??
-        (selection.primary && !isDeepStrictEqual(selection.selected.ref, selection.primary.ref)
-          ? yield* attempt({ session, agent: selection.agent, text, model: selection.primary })
-          : undefined)
-      if (!title) return
-      const expectedSequence = (yield* Bus.latestSequence(db, sessionID)) + 1
-      const current = yield* store.get(sessionID)
-      if (!current || current.title !== session.title || current.title === truncate(title)) return
-      yield* bus
-        .publish(
-          SessionEvent.Renamed,
-          {
-            sessionID: session.id,
-            title: truncate(title),
-          },
-          { commit: (sequence) => (sequence === expectedSequence ? Effect.void : Effect.die(titleChanged)) },
-        )
-        .pipe(Effect.catchDefect((defect) => (defect === titleChanged ? Effect.void : Effect.die(defect))))
-    })
+          .pipe(Effect.catchDefect((defect) => (defect === titleChanged ? Effect.void : Effect.die(defect))))
+      },
+      Effect.catchTag("SessionTitle.PoolFailure", () => Effect.void),
+    )
     return Service.of({ generate })
   }),
 )
@@ -170,5 +226,15 @@ export const layer = Layer.effect(
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Bus.node, llmClient, SessionContext.node, SessionStore.node, Database.node],
+  deps: [
+    Bus.node,
+    llmClient,
+    SessionContext.node,
+    SessionStore.node,
+    Database.node,
+    Model.node,
+    SessionRunnerModel.node,
+    AccountPool.node,
+    Provider.node,
+  ],
 })

@@ -1,20 +1,23 @@
 import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
 import { define } from "@opencode/plugin/effect/plugin"
 import type { SessionRequest } from "@opencode/plugin/effect/session"
-import { Deferred, Effect, Option, Schema, Semaphore } from "effect"
+import { Deferred, Effect, Option, Schema, Semaphore, Stream } from "effect"
 import type { Server } from "node:http"
 import { App } from "../../app.js"
 import { Credential } from "../../credential.js"
+import { credentialRequestError } from "../../credential-request-error.js"
+import { requestUsesOAuth } from "../../request-auth.js"
+import { Bus } from "../../bus.js"
 import { Integration } from "../../integration.js"
 import { OauthCallbackPage } from "../../oauth/page.js"
 import { OauthRedirect } from "../../oauth/redirect.js"
 import { Provider } from "../../provider.js"
+import { Model } from "../../model.js"
 import { SessionAffinity } from "../../session/affinity.js"
 import type { PluginInternal } from "../internal.js"
 import { configuredSettings } from "./configured.js"
 import { storedCredential } from "./credential-settings.js"
 import { OpenAISubscriptionModels } from "./openai-subscription-models.js"
-import { ProviderRefresh } from "./refresh.js"
 
 const clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
 const issuer = "https://auth.openai.com"
@@ -239,12 +242,26 @@ const headless = (app: App.Info) =>
 export const OpenAIPlugin = define({
   id: "opencode.provider.openai",
   effect: Effect.fn(function* (ctx) {
+    const bus = yield* Bus.Service
+    const catalog = yield* Provider.Service
+    const modelsService = yield* Model.Service
+    let catalogAuth: Provider.CatalogAuth = { integrationID: "openai", sourceKey: null, method: null }
     const loading = Semaphore.makeUnsafe(1)
     let chatgpt: Credential.OAuth | undefined
 
     const load = Effect.fn("OpenAIPlugin.load")(function* () {
-      const { credential } = yield* storedCredential(ctx, "openai")
+      const { connection, credential } = yield* storedCredential(ctx, "openai")
       const previous = chatgpt
+      catalogAuth = {
+        integrationID: "openai",
+        sourceKey:
+          connection?.type === "credential"
+            ? `credential:${connection.id}`
+            : connection?.type === "env"
+              ? `env:${connection.name}`
+              : null,
+        method: credential?.type === "oauth" ? credential.methodID : null,
+      }
       chatgpt =
         credential?.type === "oauth" &&
         (credential.methodID === browserMethodID || credential.methodID === headlessMethodID)
@@ -265,7 +282,8 @@ export const OpenAIPlugin = define({
     const plan = yield* OpenAISubscriptionModels.track("openai-codex", ctx.provider.reload())
     // Config applies after provider plugins, so read it here: a custom baseURL may not decode zstd.
     const configured = yield* configuredSettings(Provider.ID.openai)
-    yield* ctx.provider.transform((providers) => {
+    yield* catalog.transform((providers) => {
+      providers.bindCatalogAuth(Provider.ID.openai, catalogAuth)
       const item = providers.get(Provider.ID.openai)
       if (!item) return
       const account = chatgpt?.metadata?.accountID
@@ -284,12 +302,13 @@ export const OpenAIPlugin = define({
         })
       })
     })
-    yield* ctx.model.transform((models) => {
+    yield* modelsService.transform((models) => {
+      const method = models.provider.get(Provider.ID.openai)?.catalogAuth?.method
       for (const model of models.list(Provider.ID.openai)) {
         // ChatGPT-plan tokens only authorize codex-eligible models, and the
         // subscription covers usage, so hide the rest and zero the cost.
         models.update(model.providerID, model.id, (draft) => {
-          if (!chatgpt) return
+          if (method !== browserMethodID && method !== headlessMethodID) return
           if (plan.current) {
             if (plan.current.has(draft.id)) draft.cost = []
             else draft.enabled = false
@@ -320,7 +339,7 @@ export const OpenAIPlugin = define({
       "model.request",
       (evt) =>
         Effect.gen(function* () {
-          if (!chatgpt) return
+          if (!(yield* requestUsesOAuth([browserMethodID, headlessMethodID], chatgpt !== undefined))) return
           if (evt.baseURL && URL.canParse(evt.baseURL) && new URL(evt.baseURL).origin === "https://api.openai.com")
             evt.baseURL = codexBaseURL
           const session = yield* ctx.session
@@ -339,9 +358,14 @@ export const OpenAIPlugin = define({
       })
     for (const name of ["context", "compaction"] as const)
       yield* ctx.session.hook(name, omitOutputLimit, { providerID: Provider.ID.openai })
-    yield* ProviderRefresh.onSwitch(
-      "openai",
-      loading.withPermit(ProviderRefresh.reloadIfChanged(load(), ctx.provider.reload())),
+    const refresh = () => loading.withPermit(load().pipe(Effect.andThen(ctx.provider.reload())))
+    yield* bus.subscribe([Credential.Event.Switched, Credential.Event.Updated]).pipe(
+      Stream.filter(
+        (event) =>
+          event.type === Credential.Event.Updated.type || event.data.integrationID === Integration.ID.make("openai"),
+      ),
+      Stream.runForEach(refresh),
+      Effect.forkScoped({ startImmediately: true }),
     )
   }),
 } satisfies PluginInternal.InternalPlugin)
@@ -385,7 +409,7 @@ function request<A>(url: string, init: RequestInit) {
   return Effect.tryPromise({
     try: async (signal) => {
       const response = await fetch(url, { ...init, signal })
-      if (!response.ok) throw new Error(`Request failed: ${response.status}`)
+      if (!response.ok) throw await credentialRequestError(response)
       return response.json() as Promise<A>
     },
     catch: (cause) => cause,

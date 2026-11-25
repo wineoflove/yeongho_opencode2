@@ -240,17 +240,19 @@ describe("ChatGPTPlugin", () => {
         metadata: { clientID: "oaiapp_issued" },
       })
 
-      expect(yield* Effect.flip(refresh(value, App.make(), `${baseURL}/expired`))).toHaveProperty(
-        "message",
-        "This ChatGPT sign-in has expired or was revoked. Connect again.",
-      )
+      expect(yield* Effect.flip(refresh(value, App.make(), `${baseURL}/expired`))).toMatchObject({
+        _tag: "Credential.Request",
+        status: 400,
+        code: "invalid_grant",
+        message: "This ChatGPT sign-in has expired or was revoked. Connect again.",
+      })
       expect(yield* Effect.flip(refresh(value, App.make(), `${baseURL}/invalid`))).toHaveProperty(
         "message",
-        "Request failed: 400",
+        "Credential request failed (400)",
       )
       expect(yield* Effect.flip(refresh(value, App.make(), `${baseURL}/error`))).toHaveProperty(
         "message",
-        "Request failed: 500",
+        "Credential request failed (500)",
       )
     }),
   )

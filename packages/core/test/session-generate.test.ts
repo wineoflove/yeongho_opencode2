@@ -1,6 +1,7 @@
 import { expect } from "bun:test"
 import {
   AIError,
+  CompactionPart,
   LLMClient,
   LLMEvent,
   LLMResponse,
@@ -31,6 +32,9 @@ import { McpInstructions } from "@opencode/core/mcp/instructions"
 import { ID } from "@opencode/core/model"
 import { Project } from "@opencode/core/project"
 import { Provider } from "@opencode/core/provider"
+import { AccountPool } from "@opencode/core/account-pool"
+import { Credential } from "@opencode/core/credential"
+import { Integration } from "@opencode/core/integration"
 import { ReferenceInstructions } from "@opencode/core/reference/instructions"
 import { AbsolutePath } from "@opencode/core/schema"
 import { SessionEvent } from "@opencode/core/session/event"
@@ -63,6 +67,7 @@ import { testEffect } from "./lib/effect"
 const requests: LLMRequest[] = []
 const options: Array<StreamOptions | undefined> = []
 let instruction: string | Instructions.Unavailable = "Initial context"
+let poolBinding: AccountPool.Binding | undefined
 const sessionID = SessionSchema.ID.make("ses_generate_test")
 
 const model = LanguageModel.make({ id: "generate-model", provider: "test", route: OpenAIChat.route })
@@ -96,9 +101,9 @@ const client = Layer.mock(LLMClient.Service)({
 })
 const models = Layer.mock(SessionRunnerModel.Service)({
   select: (session) => Effect.fail(new SessionRunnerModel.ModelNotSelectedError({ sessionID: session.id })),
-  resolve: () =>
-    Effect.succeed(
-      SessionRunnerModel.resolved(model, {
+  resolve: (_session, _available, options) =>
+    Effect.succeed({
+      ...SessionRunnerModel.resolved(model, {
         capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
         cost: [
           {
@@ -109,7 +114,8 @@ const models = Layer.mock(SessionRunnerModel.Service)({
         ],
         limit: { context: 200_000, output: 32_000 },
       }),
-    ),
+      accountBinding: options?.useAccountPool ? poolBinding : undefined,
+    }),
 })
 const builtins = Layer.mock(InstructionBuiltIns.Service, {
   load: () =>
@@ -164,6 +170,7 @@ const it = testEffect(
       Agent.node,
       InstructionBuiltIns.node,
       SessionContext.node,
+      AccountPool.node,
       PluginHooks.node,
       llmClient,
     ]),
@@ -279,6 +286,107 @@ const setup = Effect.gen(function* () {
     }),
   }
 })
+
+it.effect("pooled generate rejects an installed native checkpoint before inference without changing history", () =>
+  Effect.gen(function* () {
+    requests.length = 0
+    instruction = "Initial context"
+    const { db, bus, session, instances } = yield* setup
+    yield* bus.publish(SessionEvent.Compaction.Ended, {
+      sessionID,
+      reason: "manual",
+      model: { providerID: Provider.ID.make("test"), id: ID.make("generate-model") },
+      text: "",
+      native: {
+        messages: JSON.parse(
+          JSON.stringify([
+            Message.assistant(CompactionPart.make({ provider: model.provider, encrypted: "private-checkpoint" })),
+          ]),
+        ),
+      },
+    })
+    poolBinding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_checkpoint") }
+    const before = yield* durableState(db, sessionID)
+    const error = yield* SessionGenerate.generate({ session, prompt: "Do not replay" }).pipe(
+      Effect.provideService(Instance.Service, instances),
+      Effect.result,
+    )
+    expect(error._tag).toBe("Failure")
+    expect(requests).toEqual([])
+    expect(yield* durableState(db, sessionID)).toEqual(before)
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        poolBinding = undefined
+      }),
+    ),
+  ),
+)
+
+it.effect("blocks auxiliary generation when its account pool is paused", () =>
+  Effect.gen(function* () {
+    requests.length = 0
+    const { session, instances } = yield* setup
+    const pools = yield* AccountPool.Service
+    poolBinding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_generate") }
+    yield* pools.reportFailure(poolBinding, "access-denied")
+    const error = yield* SessionGenerate.generate({ session, prompt: "Fixture" }).pipe(
+      Effect.provideService(Instance.Service, instances),
+      Effect.flip,
+    )
+    expect(error._tag).toBe("Integration.Authorization")
+    expect(requests).toHaveLength(0)
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        poolBinding = undefined
+      }),
+    ),
+  ),
+)
+
+for (const filtered of ["step", "finish"] as const) {
+  it.effect(`pauses pooled generation on a ${filtered} content-filter without returning partial text`, () =>
+    Effect.gen(function* () {
+      instruction = "Initial context"
+      const { session, instances } = yield* setup
+      const llm = yield* LLMClient.Service
+      poolBinding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_generate") }
+      const response = LLMResponse.fromEvents([
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "filtered" }),
+        LLMEvent.textDelta({ id: "filtered", text: "Must not escape" }),
+        LLMEvent.textEnd({ id: "filtered" }),
+        LLMEvent.stepFinish({ index: 0, reason: { normalized: filtered === "step" ? "content-filter" : "stop" } }),
+        LLMEvent.finish({ reason: { normalized: filtered === "finish" ? "content-filter" : "stop" } }),
+      ])
+      if (!response) return yield* Effect.die("Incomplete filtered response fixture")
+      let calls = 0
+      const generate = SessionGenerate.generate({ session, prompt: "Fixture" }).pipe(
+        Effect.provideService(Instance.Service, instances),
+        Effect.provideService(LLMClient.Service, {
+          ...llm,
+          generate: () =>
+            Effect.sync(() => {
+              calls++
+              return response
+            }),
+        }),
+      )
+      const error = yield* generate.pipe(Effect.flip)
+      expect(error._tag).toBe("Integration.Authorization")
+      const next = yield* generate.pipe(Effect.flip)
+      expect(next._tag).toBe("Integration.Authorization")
+      expect(calls).toBe(1)
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          poolBinding = undefined
+        }),
+      ),
+    ),
+  )
+}
 
 it.effect(
   "generates from fresh settled Session context and records only its usage",
@@ -442,9 +550,47 @@ it.effect(
   { timeout: 15_000 },
 )
 
+it.effect("honors the provider retry veto for auxiliary generation", () =>
+  Effect.gen(function* () {
+    instruction = "Initial context"
+    const { db, session, instances } = yield* setup
+    const before = yield* durableState(db, sessionID)
+    const hooks = yield* PluginHooks.Service
+    let decisions = 0
+    yield* hooks.register("session", "retry", (event) =>
+      Effect.sync(() => {
+        decisions++
+        event.decision = { retry: false }
+      }),
+    )
+    const llm = yield* TestLLM.Test
+    const failure = new AIError({
+      reason: new TransportError({ message: "Fixture failure", transport: "http", operation: "read" }),
+    })
+    yield* llm.push(TestLLM.failAfter(failure), TestLLM.text("Must not be sent", "unexpected"))
+    const error = yield* SessionGenerate.generate({ session, prompt: "Fixture" }).pipe(
+      Effect.provideService(Instance.Service, instances),
+      Effect.provideService(LLMClient.Service, llm),
+      Effect.flip,
+    )
+    expect(error).toBe(failure)
+    expect(decisions).toBe(1)
+    expect(yield* llm.requests()).toHaveLength(1)
+    expect(yield* durableState(db, sessionID)).toEqual(before)
+  }).pipe(Effect.provide(TestLLM.testLayer())),
+)
+
 it.effect("regenerates a failed partial answer without mutating Session history", () =>
   Effect.gen(function* () {
     instruction = "Initial context"
+    let preparations = 0
+    const hooks = yield* PluginHooks.Service
+    yield* hooks.register("session", "generate", (event) =>
+      Effect.sync(() => {
+        preparations++
+        event.options.temperature = preparations / 10
+      }),
+    )
     const { db, bus, instructions, session, instances } = yield* setup
     yield* InstructionState.prepare(db, bus, instructions, sessionID)
     const before = yield* durableState(db, sessionID)
@@ -470,7 +616,10 @@ it.effect("regenerates a failed partial answer without mutating Session history"
     expect((yield* Fiber.join(result)).text).toBe("Fresh answer")
     const requests = yield* llm.requests()
     expect(requests).toHaveLength(2)
-    expect(requests[1]).toBe(requests[0])
+    expect(requests[1]?.messages).toEqual(requests[0]?.messages)
+    expect(requests[1]?.system).toEqual(requests[0]?.system)
+    expect(preparations).toBe(1)
+    expect(requests.map((request) => request.temperature)).toEqual([0.1, 0.1])
     expect(userTexts(requests[1])).toContain("Summarize privately")
     expect(yield* durableState(db, sessionID)).toEqual(before)
     // The retried attempt counts once.

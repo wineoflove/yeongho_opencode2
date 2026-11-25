@@ -228,11 +228,11 @@ export type VoiceWebSocketTransport = { type: "websocket"; url: string; token: s
 
 export type IntegrationID = string
 
+export type CredentialID = string
+
 export type IntegrationMethodID = string
 
 export type IntegrationEnvMethod = { type: "env"; names: Array<string> }
-
-export type CredentialID = string
 
 export type ConnectionStatus = { status: "needs_auth"; message: string; url?: string }
 
@@ -780,6 +780,22 @@ export type VoiceModel = {
 }
 
 export type VoiceTransport = VoiceWebRTCTransport | VoiceWebSocketTransport
+
+export type AccountPoolStatus = {
+  integrationID: IntegrationID
+  enabled: boolean
+  strategy: "round-robin" | null
+  paused: boolean
+  lastSelectedCredentialID: CredentialID | null
+  accounts: Array<{
+    credentialID: CredentialID
+    enabled: boolean
+    failure: "access-denied" | "authentication" | "rate-limited" | "service" | "transport" | "unknown" | null
+    authInvalid: boolean
+    cooldownUntil: number | null
+    observedAt: number | null
+  }>
+}
 
 export type IntegrationCommandMethod = {
   id: IntegrationMethodID
@@ -2507,6 +2523,7 @@ export type ConfigEntry =
         agents?: {
           [x: string]: {
             model?: string | { providerID: string; model: string; variant?: string }
+            variant?: string
             request?: { headers?: { [x: string]: string }; body?: { [x: string]: JsonValue } }
             system?: string
             description?: string
@@ -4034,6 +4051,14 @@ export type ExperimentalSessionSkillInput = {
 
 export type ExperimentalSessionSkillOutput = void
 
+export type ExperimentalSessionReportInput = {
+  readonly sessionID: string
+  readonly messageID: string
+  readonly text: string
+}
+
+export type ExperimentalSessionReportOutput = { data: { messageID: SessionMessageID; reused: boolean } }["data"]
+
 export type ExperimentalSessionWaitInput = { readonly sessionID: string }
 
 export type ExperimentalSessionWaitOutput = void
@@ -4175,6 +4200,13 @@ export type ExperimentalVoiceSessionInput = {
 }
 
 export type ExperimentalVoiceSessionOutput = VoiceSessionResponse["data"]
+
+export type ProviderPoolInput = {
+  readonly providerID: string
+  readonly location?: { readonly directory?: string | undefined } | undefined
+}
+
+export type ProviderPoolOutput = { location: LocationPublicRef; data: AccountPoolStatus }
 
 export type ProviderListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 

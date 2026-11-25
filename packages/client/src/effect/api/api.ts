@@ -29,9 +29,9 @@ import type { Shell } from "@opencode/schema/shell"
 import type { Generate } from "@opencode/schema/generate"
 import type { Provider } from "@opencode/schema/provider"
 import type { Integration } from "@opencode/schema/integration"
+import type { Credential } from "@opencode/schema/credential"
 import type { Mcp } from "@opencode/schema/mcp"
 import type { PtyTicket } from "@opencode/schema/pty-ticket"
-import type { Credential } from "@opencode/schema/credential"
 import type { PermissionSaved } from "@opencode/schema/permission-saved"
 import type { FileSystem } from "@opencode/schema/filesystem"
 import type { Command } from "@opencode/schema/command"
@@ -580,6 +580,16 @@ export type ExperimentalSessionSkillOutput = void
 export type ExperimentalSessionSkillOperation<E = never> = (
   input: ExperimentalSessionSkillInput,
 ) => Effect.Effect<ExperimentalSessionSkillOutput, E>
+
+export type ExperimentalSessionReportInput = {
+  readonly sessionID: Session.ID
+  readonly messageID: SessionMessage.ID
+  readonly text: string
+}
+export type ExperimentalSessionReportOutput = { readonly messageID: SessionMessage.ID; readonly reused: boolean }
+export type ExperimentalSessionReportOperation<E = never> = (
+  input: ExperimentalSessionReportInput,
+) => Effect.Effect<ExperimentalSessionReportOutput, E>
 
 export type ExperimentalSessionWaitInput = { readonly sessionID: Session.ID }
 export type ExperimentalSessionWaitOutput = void
@@ -1445,6 +1455,7 @@ export interface ExperimentalSessionApi<E = never> {
   readonly import: ExperimentalSessionImportOperation<E>
   readonly export: ExperimentalSessionExportOperation<E>
   readonly skill: ExperimentalSessionSkillOperation<E>
+  readonly report: ExperimentalSessionReportOperation<E>
   readonly wait: ExperimentalSessionWaitOperation<E>
   readonly instructions: {
     readonly entry: {
@@ -1596,6 +1607,30 @@ export interface ExperimentalVoiceApi<E = never> {
   readonly session: ExperimentalVoiceSessionOperation<E>
 }
 
+export type ProviderPoolInput = {
+  readonly providerID: Provider.ID
+  readonly location?: { readonly directory?: string | undefined } | undefined
+}
+export type ProviderPoolOutput = {
+  readonly location: Location.PublicRef
+  readonly data: {
+    readonly integrationID: Integration.ID
+    readonly enabled: boolean
+    readonly strategy: "round-robin" | null
+    readonly paused: boolean
+    readonly lastSelectedCredentialID: Credential.ID | null
+    readonly accounts: ReadonlyArray<{
+      readonly credentialID: Credential.ID
+      readonly enabled: boolean
+      readonly failure: "access-denied" | "authentication" | "rate-limited" | "service" | "transport" | "unknown" | null
+      readonly authInvalid: boolean
+      readonly cooldownUntil: number | null
+      readonly observedAt: number | null
+    }>
+  }
+}
+export type ProviderPoolOperation<E = never> = (input: ProviderPoolInput) => Effect.Effect<ProviderPoolOutput, E>
+
 export type ProviderListInput = { readonly location?: { readonly directory?: string | undefined } | undefined }
 export type ProviderListOutput = { readonly location: Location.PublicRef; readonly data: ReadonlyArray<Provider.Info> }
 export type ProviderListOperation<E = never> = (input?: ProviderListInput) => Effect.Effect<ProviderListOutput, E>
@@ -1608,6 +1643,7 @@ export type ProviderGetOutput = { readonly location: Location.PublicRef; readonl
 export type ProviderGetOperation<E = never> = (input: ProviderGetInput) => Effect.Effect<ProviderGetOutput, E>
 
 export interface ProviderApi<E = never> {
+  readonly pool: ProviderPoolOperation<E>
   readonly list: ProviderListOperation<E>
   readonly get: ProviderGetOperation<E>
 }

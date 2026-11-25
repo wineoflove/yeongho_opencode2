@@ -40,6 +40,9 @@ import { App } from "@opencode/core/app"
 import { Agent } from "@opencode/core/agent"
 import { Model } from "@opencode/core/model"
 import { Provider } from "@opencode/core/provider"
+import { AccountPool } from "@opencode/core/account-pool"
+import { Credential } from "@opencode/core/credential"
+import { Integration } from "@opencode/core/integration"
 import { AbsolutePath } from "@opencode/core/schema"
 import { Money } from "@opencode/schema/money"
 import { Skill } from "@opencode/schema/skill"
@@ -53,6 +56,7 @@ let requests: LLMRequest[] = []
 /** Runs before a request's response streams; tests hold it back to keep a background summary in flight. */
 let beforeResponse: Effect.Effect<void> = Effect.void
 let reject: ((request: LLMRequest) => boolean) | undefined
+let contentFiltered = false
 const model = LanguageModel.make({
   id: "summary-model",
   provider: "test",
@@ -69,39 +73,40 @@ const cost = [
   },
 ]
 const client = Layer.mock(LLMClient.Service)({
-  stream: (request: LLMRequest) => {
-    requests.push(request)
-    if (reject?.(request)) {
-      return Stream.fail(
-        new AIError({
-          reason: new InvalidRequestError({ message: "prompt too long", classification: "context-overflow" }),
-        }),
-      )
-    }
-    return Stream.fromEffect(beforeResponse).pipe(
-      Stream.drain,
-      Stream.concat(
-        Stream.make(
-          LLMEvent.textDelta({ id: "summary", text: "## Objective\n- manual summary" }),
-          LLMEvent.stepFinish({
-            index: 0,
-            reason: { normalized: "stop" },
-            usage: {
-              inputTokens: 15,
-              outputTokens: 6,
-              nonCachedInputTokens: 10,
-              cacheReadInputTokens: 3,
-              cacheWriteInputTokens: 2,
-              reasoningTokens: 2,
-            },
+  stream: (request: LLMRequest) =>
+    Stream.suspend((): Stream.Stream<LLMEvent, AIError> => {
+      requests.push(request)
+      if (reject?.(request)) {
+        return Stream.fail(
+          new AIError({
+            reason: new InvalidRequestError({ message: "prompt too long", classification: "context-overflow" }),
           }),
-          LLMEvent.finish({
-            reason: { normalized: "stop" },
-          }),
+        )
+      }
+      return Stream.fromEffect(beforeResponse).pipe(
+        Stream.drain,
+        Stream.concat(
+          Stream.make(
+            LLMEvent.textDelta({ id: "summary", text: "## Objective\n- manual summary" }),
+            LLMEvent.stepFinish({
+              index: 0,
+              reason: { normalized: contentFiltered ? "content-filter" : "stop" },
+              usage: {
+                inputTokens: 15,
+                outputTokens: 6,
+                nonCachedInputTokens: 10,
+                cacheReadInputTokens: 3,
+                cacheWriteInputTokens: 2,
+                reasoningTokens: 2,
+              },
+            }),
+            LLMEvent.finish({
+              reason: { normalized: contentFiltered ? "content-filter" : "stop" },
+            }),
+          ),
         ),
-      ),
-    )
-  },
+      )
+    }),
   generate: () => Effect.die("unused"),
 })
 const resolved = SessionRunnerModel.resolved(model, {
@@ -117,6 +122,9 @@ const it = testEffect(
       SessionProjector.node,
       SessionStore.node,
       SessionCompaction.node,
+      Provider.node,
+      Credential.node,
+      AccountPool.node,
       SessionModelRequest.node,
       PluginHooks.node,
     ]),
@@ -595,6 +603,68 @@ const compactManually = (
     })
     return yield* compaction.compact({ reason: "manual", context: loaded(session, messages), inputID })
   })
+
+it.effect("pauses a bound pool when summary finishes with a content filter", () =>
+  Effect.gen(function* () {
+    requests = []
+    contentFiltered = true
+    const pools = yield* AccountPool.Service
+    const compaction = yield* SessionCompaction.Service
+    const bus = yield* Bus.Service
+    const session = yield* insertSession(Session.ID.make("ses_summary_filter_pool"))
+    const inputID = SessionMessage.ID.create()
+    const binding = { integrationID: Integration.ID.make("test"), credentialID: Credential.ID.make("cred_summary") }
+    yield* bus.publish(SessionEvent.Compaction.Started, { sessionID: session.id, reason: "manual", inputID })
+    const context = {
+      ...loaded(session, [textUser("Fixture conversation"), textUser("Summarize it")]),
+      model: { ...resolved, accountBinding: binding },
+    }
+    const outcome = yield* compaction.compact({ reason: "manual", context, inputID })
+    expect(outcome.status).toBe("failed")
+    expect((yield* pools.status(binding.integrationID)).paused).toBe(true)
+  }).pipe(
+    Effect.ensuring(
+      Effect.sync(() => {
+        contentFiltered = false
+      }),
+    ),
+  ),
+)
+
+it.effect("does not send a summary through a paused account pool", () =>
+  Effect.gen(function* () {
+    requests = []
+    const providerID = Provider.ID.make("test")
+    const integrationID = Integration.ID.make("test")
+    const modelID = Model.ID.make("summary-model")
+    const credentials = yield* Credential.Service
+    const providers = yield* Provider.Service
+    const pools = yield* AccountPool.Service
+    const account = yield* credentials.create({
+      integrationID,
+      value: Credential.Key.make({ type: "key", key: "fixture" }),
+    })
+    yield* providers.transform((catalog) => {
+      catalog.update(providerID, (draft) => {
+        draft.activation = "enabled"
+        draft.package = "@opencode/ai/providers/openai-compatible"
+        draft.settings = {
+          baseURL: "http://127.0.0.1:1/v1",
+          accountPool: { strategy: "round-robin", accounts: [{ credentialID: account.id, enabled: true }] },
+        }
+      })
+      catalog.models.update(providerID, modelID, (draft) => {
+        draft.enabled = true
+      })
+    })
+    yield* pools.reportFailure({ integrationID, credentialID: account.id }, "access-denied")
+    const session = yield* insertSession(Session.ID.make("ses_summary_paused_pool"))
+    const outcome = yield* compactManually(session, [textUser("Fixture conversation"), textUser("Summarize it")])
+    expect(outcome.status).toBe("failed")
+    if (outcome.status === "failed") expect(outcome.error.type).toBe("provider.auth")
+    expect(requests).toHaveLength(0)
+  }),
+)
 
 /** Stores messages as the session's history so far, ahead of anything published next. */
 const storeMessages = (sessionID: Session.ID, messages: readonly SessionMessage.Info[]) =>

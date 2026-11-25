@@ -1,4 +1,5 @@
 export * as SessionRunnerLLM from "./llm.js"
+import { AccountPool } from "../../account-pool.js"
 
 import { Message } from "@opencode/ai/effect"
 import { and, desc, eq, inArray, sql } from "drizzle-orm"
@@ -34,6 +35,7 @@ import { ToolOutput } from "../../tool-output.js"
 import { Plugin } from "../../plugin.js"
 import { PluginHooks } from "../../plugin/hooks.js"
 import { MAX_STEPS_PROMPT } from "./max-steps.js"
+import { assertPortableAccountHistory } from "../account-pool-history.js"
 
 const CONTINUE_AFTER_OUTPUT_LIMIT =
   "Your last response hit the output token limit (stop reason: length). Do not apologize, recap, or repeat yourself. Break the remaining work into smaller pieces."
@@ -248,15 +250,29 @@ const layer = Layer.effect(
       let retryAttempt: number | undefined
       while (true) {
         // Reuse boundary preparation once; retries refresh context without delivering more input.
-        const loaded = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
+        const candidate = initial ?? (yield* prepareContext(sessionID).pipe(Effect.flatMap(context.load)))
         initial = undefined
-        const estimate = SessionCompaction.estimatePrompt(loaded)
-        const compacted = yield* compaction.compact({ reason: "auto", context: loaded, estimate })
+        yield* assertPortableAccountHistory(candidate.model, candidate.messages).pipe(
+          Effect.mapError((cause) => new StepFailedError({ error: toSessionError(cause) })),
+        )
+        const estimate = SessionCompaction.estimatePrompt(candidate)
+        const compacted = yield* compaction.compact({ reason: "auto", context: candidate, estimate })
         if (compacted.status === "failed") return yield* new StepFailedError({ error: compacted.error })
         if (compacted.status === "completed") {
           assistantMessageID = SessionMessage.ID.create()
           continue
         }
+        const loaded = {
+          ...candidate,
+          model: yield* context.resolveModel(candidate.session, {
+            kind: "primary",
+            agent: candidate.agent.id,
+            useAccountPool: true,
+          }),
+        }
+        yield* assertPortableAccountHistory(loaded.model, loaded.messages).pipe(
+          Effect.mapError((cause) => new StepFailedError({ error: toSessionError(cause) })),
+        )
         yield* compaction.precompute(Effect.succeed(loaded), estimate)
         const stepLimitReached = loaded.agent.info.steps !== undefined && step >= loaded.agent.info.steps
         const transcript = SessionModelRequest.baseTranscript({
@@ -451,6 +467,7 @@ export const node = makeLocationNode({
   service: Service,
   layer,
   deps: [
+    AccountPool.node,
     Bus.node,
     LocationLifecycle.node,
     llmClient,

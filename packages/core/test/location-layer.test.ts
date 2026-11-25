@@ -53,12 +53,32 @@ import { Database } from "../src/database/database"
 import { Bus } from "../src/bus"
 import { Reference } from "../src/reference"
 import { Tool } from "../src/tool"
+import { Credential } from "@opencode/core/credential"
+import { Integration } from "@opencode/core/integration"
+import { SessionModelRequest } from "@opencode/core/session/model-request"
+import { SessionModelTransport } from "@opencode/core/session/model-transport"
+import { LLMClient, Message, SystemPart } from "@opencode/ai/effect"
+import { RequestExecutor } from "@opencode/ai/route"
+import { HttpClient, HttpClientResponse } from "effect/http"
 
 const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([Database.node, Bus.node, LocationServiceMap.node]), [
     Global.node.replace(tempGlobalLayer),
     offlineModels,
   ]),
+)
+const hiddenIt = testEffect(
+  AppNodeBuilder.build(
+    LayerNode.group([
+      Database.node,
+      Bus.node,
+      LocationServiceMap.node,
+      Credential.node,
+      SessionModelTransport.node,
+      Session.node,
+    ]),
+    [Global.node.replace(tempGlobalLayer), offlineModels],
+  ),
 )
 const activityLocations = Layer.effect(
   LocationServiceMap.Service,
@@ -87,6 +107,110 @@ const itWithActivity = testEffect(
 )
 
 describe("LocationServiceMap", () => {
+  for (const pooled of [false, true]) {
+    hiddenIt.live(`OpenAI hidden hook reaches primary and generate only without a pool: pooled=${pooled}`, () =>
+      tmpdirScoped().pipe(
+        Effect.flatMap((dir) =>
+          Effect.gen(function* () {
+            const sent: unknown[] = []
+            const location = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+            const credentials = yield* Credential.Service
+            const credential = yield* credentials.create({
+              integrationID: Integration.ID.make("openai"),
+              value: Credential.Key.make({ type: "key", key: "fixture-key" }),
+            })
+            yield* Effect.gen(function* () {
+              yield* Plugin.awaitActivation
+              const providers = yield* Provider.Service
+              yield* providers.transform((editor) => {
+                editor.update(Provider.ID.openai, (provider) => {
+                  provider.activation = "enabled"
+                  provider.package = "@opencode/ai/providers/openai-compatible"
+                  provider.settings = {
+                    baseURL: "http://fixture.invalid/v1",
+                    ...(pooled
+                      ? {
+                          accountPool: {
+                            strategy: "round-robin",
+                            accounts: [{ credentialID: credential.id, enabled: true }],
+                          },
+                        }
+                      : {}),
+                  }
+                })
+                editor.models.update(Provider.ID.openai, Model.ID.make("visible-review"), (model) => {
+                  model.enabled = true
+                })
+                editor.models.update(Provider.ID.openai, Model.ID.make("hidden-review"), (model) => {
+                  model.enabled = false
+                })
+              })
+              const hooks = yield* PluginHooks.Service
+              yield* hooks.register("session", "experimental.model.resolve", (event) =>
+                Effect.sync(() => {
+                  event.model = { providerID: Provider.ID.openai, id: Model.ID.make("hidden-review") }
+                }),
+              )
+              const models = yield* SessionRunnerModel.Service
+              const catalog = yield* Model.Service
+              const requests = yield* SessionModelRequest.Service.pipe(Effect.provide(SessionModelRequest.layer))
+              const sessions = yield* Session.Service
+              const session = yield* sessions.create({
+                model: { providerID: Provider.ID.openai, id: Model.ID.make("visible-review") },
+                location,
+              })
+              yield* Effect.addFinalizer(() => sessions.remove(session.id).pipe(Effect.orDie))
+              for (const kind of ["primary", "generate"] as const) {
+                const resolved = yield* models
+                  .resolve(session, catalog.available, {
+                    kind,
+                    agent: Agent.defaultID,
+                    useAccountPool: true,
+                    advanceAccountPool: false,
+                  })
+                  .pipe(Effect.result)
+                if (pooled) {
+                  expect(resolved._tag).toBe("Failure")
+                  continue
+                }
+                if (resolved._tag === "Failure") return yield* Effect.fail(resolved.failure)
+                expect(String(resolved.success.ref.id)).toBe("hidden-review")
+                const prepared = yield* requests[kind]({
+                  session,
+                  agent: Agent.defaultID,
+                  model: resolved.success,
+                  system: [SystemPart.make("fixture")],
+                  messages: [Message.user("fixture")],
+                })
+                yield* LLMClient.Service.use((llm) => llm.generate(prepared.request, prepared.options)).pipe(
+                  Effect.provide(LLMClient.layer.pipe(Layer.provide(RequestExecutor.layer), Layer.fresh)),
+                )
+              }
+            }).pipe(
+              Effect.scoped,
+              Effect.provideService(
+                HttpClient.HttpClient,
+                HttpClient.make((request) => {
+                  sent.push(request)
+                  return Effect.succeed(
+                    HttpClientResponse.fromWeb(
+                      request,
+                      new Response(
+                        'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+                        { headers: { "content-type": "text/event-stream" } },
+                      ),
+                    ),
+                  )
+                }),
+              ),
+              Effect.provide(LocationServiceMap.Service.get(location)),
+            )
+            expect(sent).toHaveLength(pooled ? 0 : 2)
+          }),
+        ),
+      ),
+    )
+  }
   for (const failure of ["file", "permissions"] as const) {
     for (const invalidate of [false, true]) {
       // The file-path fixture boots on Windows rather than failing during

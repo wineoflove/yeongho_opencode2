@@ -303,12 +303,20 @@ export { Event } from "@opencode/schema/provider"
 
 /** Provider metadata owns its drafts; model definitions remain immutable inputs. */
 export type Definition = {
+  readonly catalogAuth?: CatalogAuth | null
   readonly provider: Info
   readonly models: ReadonlyMap<Model.ID, Model.Info>
   readonly sourceConnection?: IntegrationConnection.Info
 }
 
+export interface CatalogAuth {
+  readonly integrationID: string
+  readonly sourceKey: string | null
+  readonly method: string | null
+}
+
 export interface Editor {
+  readonly bindCatalogAuth: (providerID: ID, auth: CatalogAuth) => void
   readonly list: () => readonly Definition[]
   readonly get: (providerID: ID) => Definition | undefined
   readonly add: (definition: {
@@ -370,6 +378,7 @@ const layer = Layer.effect(
           provider: MutableInfo
           models: ReadonlyMap<Model.ID, Model.Info>
           sourceConnection?: IntegrationConnection.Info
+          catalogAuth?: CatalogAuth | null
         }
       >,
       Editor
@@ -382,7 +391,8 @@ const layer = Layer.effect(
         const entry = (id: ID) => {
           const current = records.get(id)
           if (current) return current
-          const added = { provider: Info.empty(id) as MutableInfo, models: new Map<Model.ID, Model.Info>() }
+          const added: { provider: MutableInfo; models: Map<Model.ID, Model.Info>; catalogAuth?: CatalogAuth | null } =
+            { provider: Info.empty(id) as MutableInfo, models: new Map<Model.ID, Model.Info>() }
           records.set(id, added)
           maps.add(added.models)
           return added
@@ -396,10 +406,24 @@ const layer = Layer.effect(
           return owned
         }
         return {
+          bindCatalogAuth: (id, auth) => {
+            const record = entry(id)
+            const previous = record.catalogAuth
+            record.catalogAuth =
+              previous === null
+                ? null
+                : previous &&
+                    (previous.integrationID !== auth.integrationID ||
+                      previous.sourceKey !== auth.sourceKey ||
+                      previous.method !== auth.method)
+                  ? null
+                  : auth
+          },
           list: () => Array.from(records.values()),
           get: (id) => records.get(id),
           add: (definition) => {
             records.set(definition.info.id, {
+              catalogAuth: records.get(definition.info.id)?.catalogAuth,
               provider: structuredClone(definition.info) as MutableInfo,
               models: index(definition.info.id, definition.models),
               sourceConnection: definition.sourceConnection,
@@ -473,6 +497,17 @@ const layer = Layer.effect(
         const available = Array.from(records.values()).filter((record) => {
           if (record.provider.activation === "disabled") return false
           const integration = byID.get(record.provider.integrationID ?? Integration.ID.make(record.provider.id))
+          if (record.catalogAuth === null) return false
+          if (
+            record.catalogAuth &&
+            record.catalogAuth.integrationID !== (record.provider.integrationID ?? record.provider.id)
+          )
+            return false
+          if (
+            record.catalogAuth &&
+            record.catalogAuth.sourceKey !== (IntegrationConnection.key(integration?.connections[0]) ?? null)
+          )
+            return false
           // Never combine the previous account's discovered endpoints/models with a new connection.
           if (
             record.sourceConnection &&

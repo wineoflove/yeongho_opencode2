@@ -648,7 +648,7 @@ function diagnoseAgentUnsupported(value: unknown, path: string[], diagnostics: D
   Object.entries(value).forEach(([name, agent]) => {
     if (!isRecord(agent)) return
     unsupportedIfPresent(agent, "name", [...path, name, "name"], diagnostics)
-    diagnoseSelection(agent, [...path, name], diagnostics)
+    diagnoseSelection(agent, [...path, name], diagnostics, true)
   })
 }
 
@@ -659,7 +659,12 @@ function diagnoseSelectionMap(value: unknown, path: string[], diagnostics: Diagn
   })
 }
 
-function diagnoseSelection(value: Record<string, unknown>, path: string[], diagnostics: Diagnostic[]) {
+function diagnoseSelection(
+  value: Record<string, unknown>,
+  path: string[],
+  diagnostics: Diagnostic[],
+  standaloneAgentVariant = false,
+) {
   const modelValid = typeof value.model === "string" && ConfigMigrateV1.modelSelection(value.model) !== undefined
   if (own(value, "model") && typeof value.model === "string" && !modelValid)
     diagnostics.push({
@@ -670,7 +675,9 @@ function diagnoseSelection(value: Record<string, unknown>, path: string[], diagn
   if (
     own(value, "variant") &&
     typeof value.variant === "string" &&
-    (!modelValid || value.variant.length === 0 || value.variant.includes("#"))
+    ((!modelValid && !(standaloneAgentVariant && value.model === undefined)) ||
+      value.variant.length === 0 ||
+      value.variant.includes("#"))
   )
     diagnostics.push({
       kind: "unsupported",

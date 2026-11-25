@@ -89,14 +89,15 @@ export const policy = Effect.gen(function* () {
 })
 
 /** Retry a buffered model call from scratch; failed attempts never contribute to its returned output. */
-export const retry = <A, R>(effect: Effect.Effect<A, AIError, R>) =>
+export const retry = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
     const decide = yield* policy
     while (true) {
       const result = yield* Effect.result(effect)
       if (result._tag === "Success") return result.success
+      if (!(result.failure instanceof AIError)) return yield* Effect.fail(result.failure)
       const decision = yield* decide({ cause: result.failure, retry: isRetryable(result.failure) })
-      if (!decision?.retry) return yield* result.failure
+      if (!decision?.retry) return yield* Effect.fail(result.failure)
       yield* Effect.sleep(Duration.millis(decision.delay))
     }
   })

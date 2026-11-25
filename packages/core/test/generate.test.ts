@@ -213,6 +213,12 @@ resolverIt.effect("resolves dynamic models with their catalog metadata", () =>
 
     expect(result).toEqual({
       model: runtime,
+      accountBinding: undefined,
+      requestAuth: { integrationID: selected.providerID, method: null },
+      compaction: undefined,
+      cache: undefined,
+      transport: undefined,
+      chunkTimeout: undefined,
       ref: Ref.make({ providerID: selected.providerID, id: selected.id }),
       capabilities: selected.capabilities,
       cost: selected.cost,
@@ -323,7 +329,7 @@ describe("image and decision generation", () => {
         Provider.Info.make({
           ...Provider.Info.empty(providerID),
           activation: "enabled",
-          settings: 
+          settings:
             // A local host like LM Studio is enabled with no key.
             providerID === "lmstudio"
               ? { baseURL: "http://127.0.0.1:1234/v1", provider: "lmstudio", apiKey: "" }

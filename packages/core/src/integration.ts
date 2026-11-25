@@ -142,6 +142,15 @@ export class AttemptNotFoundError extends Schema.TaggedError<AttemptNotFoundErro
   attemptID: AttemptID,
 }) {}
 
+export class OAuthRefreshUnavailableError extends Schema.TaggedError<OAuthRefreshUnavailableError>()(
+  "Integration.OAuthRefreshUnavailable",
+  {},
+) {
+  override get message() {
+    return "This OAuth connection requires renewal but its authentication method cannot refresh it"
+  }
+}
+
 export type Error = CodeRequiredError | AuthorizationError | AttemptNotFoundError
 
 export { Event } from "@opencode/schema/integration"
@@ -710,8 +719,8 @@ const layer = Layer.effect(
             .get()
             .integrations.get(credential.integrationID)
             ?.implementations.get(credential.value.methodID)?.refresh
-          if (!refresh || !Credential.expiring(credential.value, yield* Clock.currentTimeMillis))
-            return credential.value
+          if (!Credential.expiring(credential.value, yield* Clock.currentTimeMillis)) return credential.value
+          if (!refresh) return yield* new AuthorizationError({ cause: new OAuthRefreshUnavailableError() })
           return yield* authorize(credentials.refresh(credential.id, { stale: Credential.expiring, refresh }))
         }),
         key: Effect.fn("Integration.connection.key")(function* (input) {

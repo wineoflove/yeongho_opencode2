@@ -27,7 +27,7 @@ export interface ProviderEditor {
   }
 }
 
-export interface ProviderDomain extends ProviderApi<unknown> {
+export interface ProviderDomain extends Omit<ProviderApi<unknown>, "pool"> {
   readonly transform: Transform<ProviderEditor>
   readonly reload: () => Effect.Effect<void>
 }

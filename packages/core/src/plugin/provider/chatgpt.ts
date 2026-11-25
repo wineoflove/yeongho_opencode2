@@ -2,11 +2,14 @@ import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect
 import type { Context } from "@opencode/plugin/effect/plugin"
 import { define } from "@opencode/plugin/effect/plugin"
 // import { Deferred, Duration, Effect, Option, Schema, Semaphore, Stream } from "effect"
-import { Deferred, Effect, Equal, Option, Schema, Semaphore } from "effect"
+import { Deferred, Effect, Equal, Option, Schema, Semaphore, Stream } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import type { Server, ServerResponse } from "node:http"
 import { App } from "../../app.js"
 import { Credential } from "../../credential.js"
+import { credentialRequestError } from "../../credential-request-error.js"
+import { requestUsesOAuth } from "../../request-auth.js"
+import { Bus } from "../../bus.js"
 import { Integration } from "../../integration.js"
 // import { IntegrationConnection } from "../../integration/connection.js"
 import { Model } from "../../model.js"
@@ -18,7 +21,6 @@ import type { PluginInternal } from "../internal.js"
 import { configuredSettings } from "./configured.js"
 import { storedCredential } from "./credential-settings.js"
 import { OpenAISubscriptionModels } from "./openai-subscription-models.js"
-import { ProviderRefresh } from "./refresh.js"
 
 // First-time sign-in registers a user-owned client; OpenAI returns its issued client ID on the callback.
 const registrationClientID = "dynamic_agent_client"
@@ -91,9 +93,6 @@ type RemoteModel = typeof RemoteModel.Type
 const RemoteModels = Schema.Struct({ models: Schema.Array(RemoteModel) })
 const decodeCachedModels = Schema.decodeUnknownOption(Schema.Array(RemoteModel))
 
-const decodeInvalidGrant = Schema.decodeUnknownOption(
-  Schema.fromJsonString(Schema.Struct({ error: Schema.Literal("invalid_grant") })),
-)
 const decodeMetadata = Schema.decodeUnknownOption(
   Schema.Struct({
     clientID: Schema.String,
@@ -228,7 +227,11 @@ function listen(server: Server) {
 export const ChatGPTPlugin = define({
   id: "opencode.provider.chatgpt",
   effect: Effect.fn(function* (ctx) {
+    const bus = yield* Bus.Service
     const credentials = yield* Credential.Service
+    const catalog = yield* Provider.Service
+    const modelsService = yield* Model.Service
+    let catalogAuth: Provider.CatalogAuth = { integrationID, sourceKey: null, method: null }
     const loading = Semaphore.makeUnsafe(1)
     let chatgpt: Credential.OAuth | undefined
     // let available: ReadonlyArray<RemoteModel> | undefined
@@ -237,6 +240,16 @@ export const ChatGPTPlugin = define({
     const load = Effect.fn("ChatGPTPlugin.load")(function* () {
       // const previous = IntegrationConnection.key(source)
       const { connection, credential } = yield* storedCredential(ctx, integrationID)
+      catalogAuth = {
+        integrationID,
+        sourceKey:
+          connection?.type === "credential"
+            ? `credential:${connection.id}`
+            : connection?.type === "env"
+              ? `env:${connection.name}`
+              : null,
+        method: credential?.type === "oauth" ? credential.methodID : null,
+      }
       chatgpt = credential?.type === "oauth" && credential.methodID === methodID ? credential : undefined
       const previous = source
       source = chatgpt ? connection : undefined
@@ -279,8 +292,12 @@ export const ChatGPTPlugin = define({
     yield* ctx.session.hook(
       "retry",
       (event) =>
-        Effect.sync(() => {
-          if (!chatgpt || !nonRetryableSharingCodes.some((code) => event.error.response?.body.includes(code))) return
+        Effect.gen(function* () {
+          if (
+            !(yield* requestUsesOAuth([methodID], chatgpt !== undefined)) ||
+            !nonRetryableSharingCodes.some((code) => event.error.response?.body.includes(code))
+          )
+            return
           event.decision = { retry: false }
         }),
       { providerID },
@@ -289,7 +306,7 @@ export const ChatGPTPlugin = define({
       "model.request",
       (evt) =>
         Effect.gen(function* () {
-          if (!chatgpt) return
+          if (!(yield* requestUsesOAuth([methodID], chatgpt !== undefined))) return
           const session = yield* ctx.session
             .get({ sessionID: evt.sessionID })
             .pipe(Effect.orElseSucceed(() => undefined))
@@ -302,7 +319,8 @@ export const ChatGPTPlugin = define({
     )
     // Config applies after provider plugins, so read it here: a custom baseURL may not decode zstd.
     const configured = yield* configuredSettings(providerID)
-    yield* ctx.provider.transform((providers) => {
+    yield* catalog.transform((providers) => {
+      providers.bindCatalogAuth(providerID, catalogAuth)
       const item = providers.get(providerID)
       if (!item) return
       if (!chatgpt || !source) return
@@ -323,13 +341,14 @@ export const ChatGPTPlugin = define({
         //   ? deriveModels(available, Array.from(item.models.values()))
         //   : Array.from(item.models.values()).filter((model) => fallbackModels.has(model.id)),
         models: Array.from(item.models.values()).filter((model) => (plan.current ?? fallbackModels).has(model.id)),
-        sourceConnection: source,
+        sourceConnection: source.type === "credential" ? { ...source, id: Credential.ID.make(source.id) } : source,
       })
     })
-    yield* ctx.model.transform((models) => {
+    yield* modelsService.transform((models) => {
+      const method = models.provider.get(providerID)?.catalogAuth?.method
       for (const model of models.list(providerID)) {
         models.update(model.providerID, model.id, (draft) => {
-          if (!chatgpt) return
+          if (method !== methodID) return
           draft.compatibility = { ...draft.compatibility, supportsEffortUpdates: false }
           // Token sharing does not support native /responses/compact.
           draft.settings = { ...draft.settings, compaction: { type: "summary" } }
@@ -376,9 +395,13 @@ export const ChatGPTPlugin = define({
     //   )
     // })
     // .pipe(Effect.andThen(refreshModels().pipe(Effect.forkScoped, Effect.asVoid)))
-    yield* ProviderRefresh.onSwitch(
-      integrationID,
-      loading.withPermit(ProviderRefresh.reloadIfChanged(load(), ctx.provider.reload())),
+    const reload = () => loading.withPermit(load().pipe(Effect.andThen(ctx.provider.reload())))
+    yield* bus.subscribe([Credential.Event.Switched, Credential.Event.Updated]).pipe(
+      Stream.filter(
+        (event) => event.type === Credential.Event.Updated.type || event.data.integrationID === integrationID,
+      ),
+      Stream.runForEach(reload),
+      Effect.forkScoped({ startImmediately: true }),
     )
     // yield* refreshModels().pipe(Effect.forkScoped)
     // yield* Effect.sleep(Duration.minutes(15)).pipe(Effect.andThen(refreshModels), Effect.forever, Effect.forkScoped)
@@ -534,8 +557,9 @@ function request<A>(url: string, init: RequestInit, rejected?: string) {
     try: async (signal) => {
       const response = await fetch(url, { ...init, signal })
       if (response.ok) return response.json() as Promise<A>
-      if (rejected && Option.isSome(decodeInvalidGrant(await response.text()))) throw new Error(rejected)
-      throw new Error(`Request failed: ${response.status}`)
+      const error = await credentialRequestError(response)
+      if (rejected && error.code === "invalid_grant") Object.defineProperty(error, "message", { value: rejected })
+      throw error
     },
     catch: (cause) => cause,
   })

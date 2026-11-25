@@ -76,6 +76,7 @@ export const registerIntegrationPolicy = Effect.fn(function* (input: {
         list: () => Effect.succeed([]),
         get: () => Effect.succeed(undefined),
         refresh: () => Effect.die("unused Credential.refresh"),
+        commitRefresh: () => Effect.die("unused Credential.commitRefresh"),
         create: () => Effect.die("unused Credential.create"),
         activate: () => Effect.die("unused Credential.activate"),
         update: () => Effect.die("unused Credential.update"),

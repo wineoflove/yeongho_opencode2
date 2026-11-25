@@ -1,6 +1,7 @@
 export * as ModelResolver from "./model-resolver.js"
 
 import { makeLocationNode } from "@opencode/util/effect/app-node"
+import { isDeepStrictEqual } from "node:util"
 import {
   DecisionModel,
   DecisionModelCompatibility,
@@ -14,7 +15,7 @@ import {
   VideoModelSchema,
 } from "@opencode/ai/effect"
 import { Auth, mergeTransport } from "@opencode/ai/route"
-import { Context, Effect, Layer, Schema, Struct } from "effect"
+import { Context, Effect, Layer, Option, Schema, Struct } from "effect"
 import { AISDK } from "./aisdk.js"
 import { Credential } from "./credential.js"
 import { Integration } from "./integration.js"
@@ -22,6 +23,13 @@ import { Capabilities, Compatibility, ID, Info, Model, Ref, VariantID } from "./
 import type { RuntimeInfo } from "./model.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
+import { ModelCredential } from "./model-credential.js"
+import { AccountPool } from "./account-pool.js"
+import { observeCredentialResolution } from "./account-pool-credential.js"
+import { validateMembership } from "./account-pool-membership.js"
+import type { RequestAuth } from "./request-auth.js"
+
+const encodeCredential = Schema.encodeSync(Credential.Value)
 
 export class VariantUnavailableError extends Schema.TaggedError<VariantUnavailableError>()(
   "SessionRunnerModel.VariantUnavailableError",
@@ -109,6 +117,25 @@ export class UnsupportedCompactionError extends Schema.TaggedError<UnsupportedCo
   }
 }
 
+export class CredentialUnavailableError extends Schema.TaggedError<CredentialUnavailableError>()(
+  "ModelResolver.CredentialUnavailableError",
+  {
+    integrationID: Integration.ID,
+    credentialID: Credential.ID,
+  },
+) {
+  override get message() {
+    return `Selected account is unavailable for ${this.integrationID}`
+  }
+}
+
+export interface ResolutionOptions {
+  readonly allowHiddenModel?: boolean
+  readonly credentialID?: Credential.ID
+  readonly useAccountPool?: boolean
+  readonly advanceAccountPool?: boolean
+}
+
 export type Error =
   | VariantUnavailableError
   | UnsupportedPackageError
@@ -119,6 +146,8 @@ export type Error =
   | Integration.AuthorizationError
 
 export interface Resolved {
+  readonly requestAuth?: RequestAuth
+  readonly accountBinding?: AccountPool.Binding
   /** Route-level model for provider requests; its id is the provider API model id, which may differ from the catalog id. */
   readonly model: LanguageModel
   /** Selected catalog identity. Durable records and displays must use this, never the API model id. */
@@ -148,10 +177,14 @@ export type MediaError =
   | Integration.AuthorizationError
 
 export interface Interface {
-  readonly resolve: (requested?: Ref) => Effect.Effect<Resolved | undefined, Error>
   /** The model used when nothing is selected: the configured default, or the first available text model. */
   readonly fallback: () => Effect.Effect<Info | undefined>
-  readonly resolveModel: (model: Info, variant?: VariantID) => Effect.Effect<Resolved, Error>
+  readonly resolve: (requested?: Ref, options?: ResolutionOptions) => Effect.Effect<Resolved | undefined, Error>
+  readonly resolveModel: (
+    model: Info,
+    variant?: VariantID,
+    options?: ResolutionOptions,
+  ) => Effect.Effect<Resolved, Error>
   /** An enabled image model by ref, or undefined when no image model has that ref. */
   readonly resolveImage: (ref: Ref) => Effect.Effect<ImageModel | undefined, MediaError>
   /** An enabled video model by ref, or undefined when no video model has that ref. */
@@ -251,7 +284,9 @@ const resolveCatalogModel = Effect.fn("ModelResolver.resolveCatalogModel")(funct
     try: () => {
       const runtime = module.model(resolved.modelID ?? resolved.id, settings)
       const timeouts = Provider.timeouts(configured)
+      const auth = ModelCredential.auth(Provider.packageName(resolved.package), credential, runtime.route.auth)
       return LanguageModel.update(runtime, {
+        ...(auth === runtime.route.auth ? {} : { route: runtime.route.with({ auth }) }),
         provider: resolved.canonical ?? resolved.providerID,
         capabilities: resolved.compatibility
           ? capabilities(runtime.capabilities, resolved.compatibility)
@@ -479,27 +514,174 @@ export const layer = Layer.effect(
     const providers = yield* Provider.Service
     const models = yield* Model.Service
     const integrations = yield* Integration.Service
+    const credentials = Option.getOrUndefined(yield* Effect.serviceOption(Credential.Service))
+    const pools = Option.getOrUndefined(yield* Effect.serviceOption(AccountPool.Service))
     const npm = yield* Npm.Service
     const aisdk = yield* AISDK.Service
     const dependencies: Dependencies = {
       loadPackage: (specifier) => Provider.loadPackage(specifier, npm),
       loadAISDK: (model) => aisdk.model(model),
     }
-    const prepare = Effect.fn("ModelResolver.prepare")(function* (selected: Info, variant?: VariantID) {
-      const provider = yield* providers.get(selected.providerID)
-      const connection = yield* integrations.connection.active(
-        provider?.integrationID ?? Integration.ID.make(selected.providerID),
-      )
-      const credential = connection ? yield* integrations.connection.resolve(connection) : undefined
-      const selectedVariant = yield* withVariant(selected, variant)
+    const prepare = Effect.fn("ModelResolver.prepare")(function* (
+      selected: Info,
+      variant?: VariantID,
+      options?: ResolutionOptions,
+    ) {
+      const bound = options?.useAccountPool || options?.credentialID !== undefined
+      const catalog = bound ? yield* models.catalog(selected.providerID, selected.id) : undefined
+      const definition =
+        catalog?.definition ??
+        (options?.allowHiddenModel
+          ? (yield* providers.snapshot()).available.find((entry) => entry.provider.id === selected.providerID)
+          : undefined)
+      const catalogModel = catalog?.model ?? selected
+      const provider = definition ? definition.provider : yield* providers.get(selected.providerID)
+      if (bound && !catalog && (!options?.allowHiddenModel || provider?.settings?.accountPool !== undefined))
+        return yield* new Integration.AuthorizationError({ cause: "Requested catalog entry is unavailable" })
+      const integrationID = provider?.integrationID ?? Integration.ID.make(selected.providerID)
+      const pool =
+        options?.useAccountPool && options.credentialID === undefined && provider?.settings?.accountPool !== undefined
+          ? yield* Schema.decodeUnknownEffect(AccountPool.Config)(provider.settings.accountPool).pipe(
+              Effect.mapError((cause) => new Integration.AuthorizationError({ cause })),
+            )
+          : undefined
+      if (pool && (!pools || !credentials)) {
+        return yield* new Integration.AuthorizationError({ cause: new AccountPool.UnavailableError({ integrationID }) })
+      }
+      if (pool && credentials)
+        yield* validateMembership(integrationID, pool).pipe(Effect.provideService(Credential.Service, credentials))
+      const credentialID =
+        options?.credentialID ??
+        (pool && pools
+          ? yield* pools
+              .select(
+                integrationID,
+                pool.accounts.filter((entry) => entry.enabled).map((entry) => entry.credentialID),
+                { advance: options?.advanceAccountPool },
+              )
+              .pipe(Effect.mapError((cause) => new Integration.AuthorizationError({ cause })))
+          : undefined)
+      const connection = credentialID
+        ? (yield* integrations.get(integrationID))?.connections.find(
+            (entry) => entry.type === "credential" && entry.id === credentialID,
+          )
+        : yield* integrations.connection.active(integrationID)
+      if (credentialID && !connection) {
+        return yield* new Integration.AuthorizationError({
+          cause: new CredentialUnavailableError({ integrationID, credentialID }),
+        })
+      }
+      if (pool && connection?.type === "credential" && connection.method === "external") {
+        return yield* new Integration.AuthorizationError({ cause: new AccountPool.UnavailableError({ integrationID }) })
+      }
+      const resolution =
+        pool && options?.advanceAccountPool === false && credentialID && credentials
+          ? credentials.get(credentialID).pipe(Effect.map((entry) => entry?.value))
+          : connection
+            ? integrations.connection.resolve(connection)
+            : Effect.succeed(undefined)
+      if (bound && integrationID === "openai" && credentialID && credentials) {
+        const stored = yield* credentials.get(credentialID)
+        const auth = definition?.catalogAuth
+        const method = stored?.value.type === "oauth" ? stored.value.methodID : null
+        if (!stored || !auth || auth.integrationID !== integrationID || auth.method !== method)
+          return yield* new Integration.AuthorizationError({
+            cause: "Selected authentication does not match the model catalog",
+          })
+      }
+      const credential = yield* pool && pools && credentialID
+        ? observeCredentialResolution(resolution, pools, { integrationID, credentialID })
+        : resolution
+      if (credentialID && credential === undefined) {
+        return yield* new Integration.AuthorizationError({
+          cause: new CredentialUnavailableError({ integrationID, credentialID }),
+        })
+      }
+      if (bound && integrationID === "openai") {
+        const auth = definition?.catalogAuth
+        const method = credential?.type === "oauth" ? credential.methodID : null
+        if (!auth || auth.integrationID !== integrationID || auth.method !== method)
+          return yield* new Integration.AuthorizationError({
+            cause: "Selected authentication does not match the model catalog",
+          })
+      }
+      const selectedVariant = yield* withVariant(catalogModel, variant)
       const runtimeInfo: RuntimeInfo = {
         ...selectedVariant,
-        settings: Provider.mergeOverlay(provider?.settings, Provider.modelSettings(selectedVariant.settings)),
+        settings: Provider.mergeOverlay(
+          provider?.settings && Struct.omit(provider.settings, ["accountPool"]),
+          Provider.modelSettings(selectedVariant.settings),
+        ),
+        ...(credentialID && credential
+          ? {
+              headers: yield* Effect.try({
+                try: () => ModelCredential.headers(integrationID, credential, selectedVariant.headers),
+                catch: (cause) => new Integration.AuthorizationError({ cause }),
+              }),
+            }
+          : {}),
       }
-      return { provider, credential, runtimeInfo }
+      return {
+        catalogModel,
+        requestAuth: { integrationID, method: credential?.type === "oauth" ? credential.methodID : null },
+        provider,
+        credential,
+        runtimeInfo,
+        accountBinding:
+          pool && credentialID
+            ? {
+                integrationID,
+                credentialID,
+                validate: () =>
+                  Effect.gen(function* () {
+                    const current = yield* models.catalog(selected.providerID, selected.id)
+                    const definition = current?.definition.provider
+                    if (
+                      !credentials ||
+                      !credential ||
+                      !current?.model.enabled ||
+                      (definition?.integrationID ?? Integration.ID.make(selected.providerID)) !== integrationID ||
+                      definition?.settings?.accountPool === undefined
+                    )
+                      return yield* new AccountPool.UnavailableError({ integrationID })
+                    const configured = yield* Schema.decodeUnknownEffect(AccountPool.Config)(
+                      definition.settings.accountPool,
+                    )
+                    if (
+                      !configured.accounts.some((account) => account.credentialID === credentialID && account.enabled)
+                    )
+                      return yield* new AccountPool.UnavailableError({ integrationID })
+                    yield* validateMembership(integrationID, configured).pipe(
+                      Effect.provideService(Credential.Service, credentials),
+                    )
+                    const saved = yield* credentials.get(credentialID)
+                    if (
+                      !saved ||
+                      saved.integrationID !== integrationID ||
+                      !isDeepStrictEqual(encodeCredential(saved.value), encodeCredential(credential))
+                    )
+                      return yield* new AccountPool.UnavailableError({ integrationID })
+                  }).pipe(
+                    Effect.mapError((error) =>
+                      error instanceof AccountPool.UnavailableError
+                        ? error
+                        : new AccountPool.StateUnavailableError({ integrationID }),
+                    ),
+                  ),
+              }
+            : undefined,
+      }
     })
-    const load = Effect.fn("ModelResolver.resolveModel")(function* (selected: Info, variant?: VariantID) {
-      const { provider, credential, runtimeInfo } = yield* prepare(selected, variant)
+    const load = Effect.fn("ModelResolver.resolveModel")(function* (
+      selected: Info,
+      variant?: VariantID,
+      options?: ResolutionOptions,
+    ) {
+      const { provider, credential, runtimeInfo, accountBinding, catalogModel, requestAuth } = yield* prepare(
+        selected,
+        variant,
+        options,
+      )
       const model = yield* fromCatalogModel(runtimeInfo, credential, dependencies)
       const runtime =
         provider?.activation === "enabled" &&
@@ -510,14 +692,16 @@ export const layer = Layer.effect(
           : model
       return {
         model: runtime,
+        accountBinding,
+        requestAuth,
         ref: Ref.make({
           id: selected.id,
           providerID: selected.providerID,
           ...(variant === undefined ? {} : { variant }),
         }),
-        capabilities: selected.capabilities,
-        cost: selected.cost,
-        limit: selected.limit,
+        capabilities: catalogModel.capabilities,
+        cost: catalogModel.cost,
+        limit: catalogModel.limit,
         compaction: runtimeInfo.settings?.compaction,
         cache: runtimeInfo.settings?.cache,
         // The WebSocket transport can't present a client certificate, so `tls` keeps the model on HTTP.
@@ -555,10 +739,10 @@ export const layer = Layer.effect(
       return (yield* models.available()).find((model) => hasPackage(model) && Model.supportsText(model))
     })
     return Service.of({
-      resolve: Effect.fn("ModelResolver.resolve")(function* (requested) {
+      resolve: Effect.fn("ModelResolver.resolve")(function* (requested, options) {
         const selected = requested ? yield* models.get(requested.providerID, requested.id) : yield* fallback()
-        if (!selected) return undefined
-        return yield* load(selected, requested?.variant)
+        if (!selected || (!selected.enabled && !options?.allowHiddenModel)) return undefined
+        return yield* load(selected, requested?.variant, options)
       }),
       fallback,
       resolveModel: load,
@@ -633,5 +817,5 @@ function usesAPIKeyAuth(packageName: string | undefined) {
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Provider.node, Model.node, Integration.node, Npm.node, AISDK.node],
+  deps: [Provider.node, Model.node, Integration.node, Credential.node, Npm.node, AISDK.node, AccountPool.node],
 })
