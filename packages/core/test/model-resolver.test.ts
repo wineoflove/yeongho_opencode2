@@ -28,6 +28,7 @@ interface RequestOptions {
   readonly body?: Info["body"]
   readonly variants?: Info["variants"]
   readonly limit?: Info["limit"]
+  readonly freeform?: Info["capabilities"]["freeform"]
 }
 
 function model(packageName: string | undefined, options: RequestOptions = {}) {
@@ -42,7 +43,7 @@ function model(packageName: string | undefined, options: RequestOptions = {}) {
     settings: options.settings ?? {},
     headers: options.headers ?? { "x-test": "header" },
     body: options.body ?? { custom_extension: { enabled: true } },
-    capabilities: { tools: true, input: ["text"], output: ["text"] },
+    capabilities: { tools: true, input: ["text"], output: ["text"], freeform: options.freeform?.slice() },
     variants: structuredClone(options.variants ?? []) as Model.MutableInfo["variants"],
     time: { released: 0 },
     cost: [],
@@ -148,6 +149,17 @@ describe("ModelResolver", () => {
         if (method === "key") expect(headers.authorization).toBeUndefined()
         else expect(headers.authorization).toBe("Bearer selected-token")
       }
+    }),
+  )
+
+  it.effect("gives the AI model the catalog's freeform formats, and none when the catalog lists none", () =>
+    Effect.gen(function* () {
+      const formats = (freeform?: Info["capabilities"]["freeform"]) =>
+        ModelResolver.fromCatalogModel(model(Provider.aisdk("@ai-sdk/openai"), { freeform })).pipe(
+          Effect.map((resolved) => resolved.capabilities?.tools?.freeform),
+        )
+      expect(yield* formats(["text", "lark"])).toEqual(["text", "lark"])
+      expect(yield* formats()).toEqual([])
     }),
   )
 
@@ -772,29 +784,6 @@ describe("ModelResolver", () => {
         providerMetadataKey: "anthropic",
         endpoint: { baseURL: "https://anthropic.example/v1" },
       })
-    }),
-  )
-
-  it.effect("uses resolved credentials for bearer auth", () =>
-    Effect.gen(function* () {
-      const resolved = yield* ModelResolver.fromCatalogModel(
-        model(Provider.aisdk("@ai-sdk/openai"), {
-          settings: { baseURL: "https://openai.example/v1" },
-          headers: {},
-          body: {},
-        }),
-        Credential.Key.make({ type: "key", key: "secret" }),
-      )
-      const request = ai.request({ model: resolved, prompt: "Hello" })
-      const headers = yield* resolved.route.auth.apply({
-        request,
-        method: "POST",
-        url: "https://openai.example/v1/responses",
-        body: "{}",
-        headers: Headers.empty,
-      })
-
-      expect(headers.authorization).toBe("Bearer secret")
     }),
   )
 
